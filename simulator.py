@@ -3,44 +3,52 @@
 依赖库：numpy, matplotlib
 """
 import numpy as np
-import random
+import os, datetime, math, shutil, random
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-import matplotlib
-import os
-import datetime
-import math
-import shutil
-matplotlib.use('Agg')  # 使用非交互式后端
 
-# ABC 算法参数
-NUM_BEES = 10           # 减少蜜蜂数量
-LIMIT = 100            # 放弃蜜源阈值
-SEARCH_RANGE = (0, 1)   # 调整搜索范围为0-1
-HIVE_POS = (0.5, 0.1)   # 蜂巢位置
-NUM_FOOD_SOURCES = 5    # 蜜源数量
-AP_POSITIONS = [(0.25, 0.5), (0.75, 0.5)]  # 访问点位置
-NECTAR_FULL = 15
-NECTAR_RECOVERY_TIME = 8
+# Environment and Display Parameters
+NUM_BEES = 10
+NUM_FOOD_SOURCES = 5  
+HIVE_POS = (0.5, 0.1)                  # normalized
+AP_POS = [(0.25, 0.5), (0.75, 0.5)]    # normalized
+FIG_SIZE = (8, 8)
+NECTAR_DISPLAY_SIZE = 50
+NECTAR_EXPECTED_STORAGE = 15
+NECTAR_EXPECTED_RECOVERY_TIME = 20
 
-# 模拟参数
-FIG_SIZE = (8, 8)      # 画布尺寸
-FRAME_TIME = 50      # 飞行速度（毫秒/帧）
-SIM_TIME = 60000      # 动画时长（毫秒）
-GIF_FRAMES = round(SIM_TIME / FRAME_TIME)
-FLIGHT_NOISE = 0.01
-MIN_STEP = 0.01
-MAX_STEP = 0.02
-BASE_FOOD_SIZE = 50
+# Simulation Parameters
+FRAME_TIME = 50    # ms
+SIM_TIME = 6000   # ms
+NUM_FRAMES = round(SIM_TIME / FRAME_TIME)
 
-# 记录参数
-BEE_MOVEMENT_DISAPPEAR_TIME = 10000 # 蜜蜂移动消失时间 (毫秒)
-BEE_HISTORY_LENGTH = 200  # 每个蜜蜂记录的历史位置数
+# Bee Parameters
+# bumblebee movement speed: x m/s (normally)
+# which is (x / FIELD_SIZE) * normalized_edge_length m/s
+# 1s = 20 frames
+# 1 frame = (x / FIELD_SIZE / 20) * normalized_edge_length m
+FIELD_SIZE = 50        # m
+BUMBLEBEE_SPEED = 5    # m/s
+STEP_SIZE = BUMBLEBEE_SPEED / FIELD_SIZE / 20
+MIN_STEP = 0.75 * STEP_SIZE 
+MAX_STEP = 1.25 * STEP_SIZE
+STEP_NOISE = 0.25 * STEP_SIZE
+NECTAR_DISCOVERY_DISTANCE = 5 * STEP_SIZE
+NECTAR_EMPTY_DISCOVERY_DISTANCE = 10 * STEP_SIZE
+OVERLAP_DISTANCE_ERROR = 3 * STEP_SIZE
+MOVEMENT_DISAPPEAR_TIME = 10000 # ms
 
-class FoodSource:
+
+if os.path.exists('bee_flight.gif'):
+    os.remove('bee_flight.gif')
+if os.path.exists('sim_figures'):
+    shutil.rmtree('sim_figures')
+
+# Class definitions
+class Food:
     def __init__(self, position):
         self.position = position
-        self.nectar = round((0.8 + 0.4 * random.random()) * NECTAR_FULL)
+        self.nectar = round((0.8 + 0.4 * random.random()) * NECTAR_EXPECTED_STORAGE)
         self.recovery_timer = 0
 
 class Bee:
@@ -59,32 +67,10 @@ class Bee:
         # 添加当前位置和时间戳
         self.history.append((self.position.copy(), frame_time))
         # 保持历史记录长度
-        if len(self.history) > math.ceil(BEE_MOVEMENT_DISAPPEAR_TIME / FRAME_TIME):
+        if len(self.history) > math.ceil(MOVEMENT_DISAPPEAR_TIME / FRAME_TIME):
             self.history.pop(0)
 
-# 修改蜜源初始化部分
-def generate_valid_position(existing_positions, min_dist=0.1):
-    while True:
-        pos = np.random.rand(2)
-        pos[0] = 0.05 + 0.9 * pos[0]
-        pos[1] = 0.05 + 0.9 * pos[1]
-        if all(np.linalg.norm(pos - p) >= min_dist for p in existing_positions):
-            return pos
-
-# 生成蜜源时考虑最小距离
-all_positions = [HIVE_POS] + AP_POSITIONS
-food_sources = []
-for _ in range(NUM_FOOD_SOURCES):
-    pos = generate_valid_position(all_positions)
-    all_positions.append(pos)
-    food_sources.append(FoodSource(pos))
-
-# 目标函数（示例：Rastrigin函数）
-def fitness_function(pos):
-    return -((pos[0]**2 - 10*np.cos(2*np.pi*pos[0])) + 
-            (pos[1]**2 - 10*np.cos(2*np.pi*pos[1])) + 20)
-
-class ABCAlgorithm:
+class Simulation:
     def __init__(self, food_sources):
         self.start_time = datetime.datetime.now()
         self.bees = [Bee(food_sources) for _ in range(NUM_BEES)]
@@ -92,53 +78,45 @@ class ABCAlgorithm:
         self.frame_count = 0
 
     def get_current_time(self):
-        return (datetime.datetime.now() - self.start_time).total_seconds() * 1000  # 毫秒
+        return (datetime.datetime.now() - self.start_time).total_seconds() * 1000
 
     def update_nectar(self):
         self.frame_count += 1
-        for i, fs in enumerate(self.food_sources):
+        for _, fs in enumerate(self.food_sources):
             if fs.nectar == -1: 
                 if fs.recovery_timer > 0:
                     fs.recovery_timer -= 1
                 else:
-                    fs.nectar = round((0.8 + 0.4 * random.random()) * NECTAR_FULL)
+                    fs.nectar = round((0.8 + 0.4 * random.random()) * NECTAR_EXPECTED_STORAGE)
                     fs.recovery_timer = 0
 
-    def update_positions(self):
-        self.update_nectar()
-        
+    def update_bees(self):
         for bee in self.bees:
-            if not bee.has_food:
-                # 在移动前检查附近蜜源
+            if not bee.has_food: 
+
+                # Clear the target food if it is found to be empty
                 for fs in self.food_sources:
                     distance = np.linalg.norm(fs.position - bee.position)
-                    if distance < 0.1:
+                    if distance < NECTAR_EMPTY_DISCOVERY_DISTANCE:
                         if fs.nectar <= 0:
                             bee.known_empty_sources.add(fs)
                         else:
                             bee.target_food = fs
                             bee.known_empty_sources.discard(fs)
                     
-                    # 规则2：中距离(0.2)吸引力判断
-                    if (distance < 0.2 and 
-                        fs != bee.target_food and 
-                        fs.nectar > 0 and 
+                    if (distance < NECTAR_DISCOVERY_DISTANCE and 
+                        fs != bee.target_food and fs.nectar > 0 and 
                         fs not in bee.known_empty_sources):
-                        
-                        # 比较当前目标距离
                         if bee.target_food is None:
                             bee.target_food = fs
                         else:
                             current_dist = np.linalg.norm(bee.target_food.position - bee.position)
                             if distance < current_dist:
                                 bee.target_food = fs
-                
-                # 如果当前目标被发现无蜜，立即清除
-                if (bee.target_food and 
-                    bee.target_food in bee.known_empty_sources):
+                if (bee.target_food and bee.target_food in bee.known_empty_sources):
                     bee.target_food = None
                 
-                # 自动寻找新目标
+                # Find a new target food
                 if not bee.target_food:
                     potential_sources = [
                         fs for fs in self.food_sources 
@@ -150,16 +128,17 @@ class ABCAlgorithm:
                     else:
                         bee.reset_knowledge()
                 
+                # Move to the target food
                 if bee.target_food:
                     direction = bee.target_food.position - bee.position
                     distance = np.linalg.norm(direction)
                     if distance > 0:
-                        step_size = np.clip(0.02 * distance, MIN_STEP, MAX_STEP)
+                        step_size = np.clip(STEP_SIZE * distance, MIN_STEP, MAX_STEP)
                         step = (direction / distance) * step_size
-                        bee.position += step + np.random.normal(0, FLIGHT_NOISE, 2)
-                    
-                    # 到达后检查蜜量
-                    if np.linalg.norm(bee.position - bee.target_food.position) < 0.02:
+                        bee.position += step + np.random.normal(0, STEP_NOISE, 2)
+
+                    # Arrived at the target food
+                    if np.linalg.norm(bee.position - bee.target_food.position) < OVERLAP_DISTANCE_ERROR:
                         if bee.target_food.nectar > 0:
                             bee.target_food.nectar -= 1
                             bee.has_food = True
@@ -167,81 +146,76 @@ class ABCAlgorithm:
                             bee.known_empty_sources.add(bee.target_food)
                         bee.target_food = None
             else:
-                # 返回蜂巢
+                # Move back to Hive
                 direction = np.array(HIVE_POS) - bee.position
                 distance = np.linalg.norm(direction)
                 if distance > 0:
-                    step_size = np.clip(0.02 * distance, MIN_STEP, MAX_STEP)
-                    step = (direction / distance) * step_size  # 标准化方向向量
-                    bee.position += step + np.random.normal(0, FLIGHT_NOISE, 2)
+                    step_size = np.clip(STEP_SIZE * distance, MIN_STEP, MAX_STEP)
+                    step = (direction / distance) * step_size
+                    bee.position += step + np.random.normal(0, STEP_NOISE, 2)
                 
-                # 到达蜂巢判断
-                if np.linalg.norm(bee.position - HIVE_POS) < 0.02:
-                    bee.has_food = False
+                    # Arrived at Hive
+                    if np.linalg.norm(bee.position - HIVE_POS) < OVERLAP_DISTANCE_ERROR:
+                        bee.has_food = False
 
-        for i, fs in enumerate(self.food_sources):
+        for _, fs in enumerate(self.food_sources):
             if fs.nectar == 0: 
                 fs.nectar = -1
-                fs.recovery_timer = 1000 / FRAME_TIME * NECTAR_RECOVERY_TIME
+                fs.recovery_timer = 1000 / FRAME_TIME * NECTAR_EXPECTED_RECOVERY_TIME * (0.8 + 0.4 * random.random())
 
+# Generate food sources
+def generate_valid_position(existing_positions, min_dist=0.1):
+    while True:
+        pos = np.random.rand(2)
+        pos[0] = 0.05 + 0.9 * pos[0]
+        pos[1] = 0.05 + 0.9 * pos[1]
+        if all(np.linalg.norm(pos - p) >= min_dist for p in existing_positions):
+            return pos
+all_positions = [HIVE_POS] + AP_POS
+food_sources = []
+for _ in range(NUM_FOOD_SOURCES):
+    pos = generate_valid_position(all_positions)
+    all_positions.append(pos)
+    food_sources.append(Food(pos))
 
-# 在初始化算法和画布前添加清理代码
-if os.path.exists('bee_flight.gif'):
-    os.remove('bee_flight.gif')
-if os.path.exists('sim_figures'):
-    shutil.rmtree('sim_figures')
-
-# 初始化算法和画布
-abc = ABCAlgorithm(food_sources)
+# Draw the initial elements
+sim = Simulation(food_sources)
 fig, ax = plt.subplots(figsize=FIG_SIZE)
 ax.set_xlim(0, 1)
 ax.set_ylim(0, 1)
 ax.set_facecolor('black')
-
-# 初始化蜜蜂图形元素
-scatter = ax.scatter(
+bee_scatter = ax.scatter(
     [], [], 
     c='yellow', 
     s=50, 
     alpha=0.2,
     edgecolors='white',
-    label='Bees'  # 添加标签
+    label='Bees'
 )
-best_bee, = ax.plot([], [], 'ro', markersize=12, alpha=0.8)
-
-# 恢复主图形的元素绘制
-# 蜂巢（绿色方块）
+ax.plot([], [], 'ro', markersize=12, alpha=0.8)
 ax.plot(HIVE_POS[0], HIVE_POS[1], 'gs', markersize=15, label='Hive')
-
-# 蜜源（蓝色圆点）
 food_scatter = ax.scatter(
     [fs.position[0] for fs in food_sources],
     [fs.position[1] for fs in food_sources],
     c='#1E90FF', 
-    s=[fs.nectar/NECTAR_FULL*BASE_FOOD_SIZE*2 for fs in food_sources],
+    s=[fs.nectar / NECTAR_EXPECTED_STORAGE * NECTAR_DISPLAY_SIZE * 2 for fs in food_sources],
     edgecolors='white'
 )
-
-# 访问点（红色三角形）
-for i, ap in enumerate(AP_POSITIONS):
-    label = 'AP' if i == 0 else None  # 只为第一个AP添加标签
+for i, ap in enumerate(AP_POS):
+    label = 'AP' if i == 0 else None
     ax.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8, label=label)
-
-# 恢复蜜量文字标签的更新
 food_labels = [ax.text(fs.position[0], fs.position[1]+0.02, str(fs.nectar), 
                       ha='center', va='bottom', color='white', fontsize=8)
               for fs in food_sources]
-
-# 修改图例元素设置
 legend_elements = [
     plt.Line2D([0], [0], 
                marker='o', 
-               color='none',  # 透明线条
+               color='none', 
                markerfacecolor='yellow',
                markersize=10, 
                label='Bees',
                alpha=0.7,
-               markeredgewidth=0),  # 移除边缘
+               markeredgewidth=0), 
     plt.Line2D([0], [0],
                marker='o',
                color='none',
@@ -266,115 +240,98 @@ legend_elements = [
 ]
 ax.legend(handles=legend_elements, loc='upper right')
 
-# 修改轨迹保存部分
-def save_bee_trails(frame, current_time):
-    os.makedirs('sim_figures', exist_ok=True)
-    
-    for i, bee in enumerate(abc.bees):
-        # 创建每个蜜蜂的专属文件夹
-        bee_dir = f'sim_figures/bee_{i:02d}'
-        os.makedirs(bee_dir, exist_ok=True)
-        
-        # 创建新画布
-        fig_bee, ax_bee = plt.subplots(figsize=FIG_SIZE)
-        ax_bee.set_xlim(0, 1)
-        ax_bee.set_ylim(0, 1)
-        ax_bee.set_facecolor('black')
-        
-        # 只绘制访问点
-        for ap in AP_POSITIONS:
-            ax_bee.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8)
-        
-        # 绘制该蜜蜂的轨迹
-        trail_positions = []
-        trail_alphas = []
-        for pos, timestamp in bee.history:
-            age = current_time - timestamp
-            alpha = max(0, 1 - age/BEE_MOVEMENT_DISAPPEAR_TIME)
-            if alpha > 0:
-                trail_positions.append(pos)
-                trail_alphas.append(alpha)
-        
-        if trail_positions:
-            ax_bee.scatter(
-                [p[0] for p in trail_positions],
-                [p[1] for p in trail_positions],
-                c="yellow", 
-                s=20,
-                alpha=trail_alphas,
-                edgecolors='none'
-            )
-        
-        # 保存并关闭
-        plt.savefig(f'{bee_dir}/trail_{frame:04d}.png', dpi=150, bbox_inches='tight')
-        plt.close(fig_bee)
 
-
-
+# Update the frame
 def update(frame):
-    current_time = abc.get_current_time()
     
-    # 更新所有蜜蜂的历史记录
-    for bee in abc.bees:
+    # Update bee history and save the bee trail
+    def save_bee_trails(frame, current_time):
+        os.makedirs('sim_figures', exist_ok=True)
+        for i, bee in enumerate(sim.bees):
+
+            # Create a unique folder for each bee
+            bee_dir = f'sim_figures/bee_{i:02d}'
+            os.makedirs(bee_dir, exist_ok=True)
+            
+            # Create a new canvas
+            fig_bee, ax_bee = plt.subplots(figsize=FIG_SIZE)
+            ax_bee.set_xlim(0, 1)
+            ax_bee.set_ylim(0, 1)
+            ax_bee.set_facecolor('black')
+            
+            # Draw the access points
+            for ap in AP_POS:
+                ax_bee.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8)
+            
+            # Draw the trajectory of this bee
+            trail_positions = []
+            trail_alphas = []
+            for pos, timestamp in bee.history:
+                age = current_time - timestamp
+                alpha = max(0, 1 - age/MOVEMENT_DISAPPEAR_TIME)
+                if alpha > 0:
+                    trail_positions.append(pos)
+                    trail_alphas.append(alpha)
+            
+            if trail_positions:
+                ax_bee.scatter(
+                    [p[0] for p in trail_positions],
+                    [p[1] for p in trail_positions],
+                    c="yellow", 
+                    s=20,
+                    alpha=trail_alphas,
+                    edgecolors='none'
+                )
+            
+            # Save and close
+            plt.savefig(f'{bee_dir}/trail_{frame:04d}.png', dpi=150, bbox_inches='tight')
+            plt.close(fig_bee)
+    current_time = sim.get_current_time()
+    for bee in sim.bees:
         bee.update_history(current_time)
+    if (frame + 1) % (NUM_FRAMES // 10) == 0:
+        save_bee_trails(frame+1, current_time)
     
-    # 保存一次轨迹图（共保存10次）
-    if frame % (GIF_FRAMES//10) == 0:
-        save_bee_trails(frame, current_time)
-    
-    abc.update_positions()
-    
-    # 更新蜜蜂位置和透明度
-    positions = np.array([b.position for b in abc.bees])
-    alphas = [0.7 if b.has_food else 0.2 for b in abc.bees]
-    scatter.set_offsets(positions)
-    scatter.set_alpha(alphas)
-    
-    # 更新蜜源状态
+    # Update the bees and nectars (and their displays)
+    sim.update_bees()
+    sim.update_nectar()
+    positions = np.array([b.position for b in sim.bees])
+    alphas = [0.7 if b.has_food else 0.2 for b in sim.bees]
+    bee_scatter.set_offsets(positions)
+    bee_scatter.set_alpha(alphas)
     food_sizes = []
     food_alphas = []
-    for fs in abc.food_sources:
+    for fs in sim.food_sources:
         if fs.nectar > 0:
-            size = (1 + (fs.nectar/NECTAR_FULL)) * BASE_FOOD_SIZE
+            size = (1 + (fs.nectar / NECTAR_EXPECTED_STORAGE)) * NECTAR_DISPLAY_SIZE
             alpha = 0.7
         else:
-            size = BASE_FOOD_SIZE
+            size = NECTAR_DISPLAY_SIZE
             alpha = 0.2
         food_sizes.append(size)
         food_alphas.append(alpha)
     food_scatter.set_sizes(food_sizes)
     food_scatter.set_alpha(food_alphas)
-
-    # 恢复蜜量标签更新
-    for fs, label in zip(abc.food_sources, food_labels):
+    for fs, label in zip(sim.food_sources, food_labels):
         if fs.nectar > 0: 
             label.set_text(str(fs.nectar))
             label.set_visible(True)
         else:
             label.set_visible(False)
-    
-    return [scatter, food_scatter] + food_labels
+    return [bee_scatter, food_scatter] + food_labels
 
-# 创建动画
+# Save the animation
+print("Generating animation...")
 ani = FuncAnimation(
     fig, 
     update, 
-    frames=GIF_FRAMES, 
+    frames=NUM_FRAMES, 
     interval=FRAME_TIME, 
     blit=True,
     repeat=False
 )
-
-# 保存GIF并自动关闭窗口
-print("正在生成动画...")
 ani.save('bee_flight.gif', 
          writer='pillow', 
-         fps=1000//FRAME_TIME,  # 根据帧间隔计算正确fps
-         progress_callback=lambda i, n: print(f'进度: {i+1}/{n} 帧', end='\r'))
-print("\n动画保存完成!")
-plt.close(fig)
-plt.show()
-
-# 在文件最后添加（保存完成后打开文件夹）
-print("正在打开结果文件夹...")
-
+         fps=1000//FRAME_TIME,
+         progress_callback=lambda i, n: print(f'Progress: {i+1}/{n} frames', end='\r'))
+print("\nAnimation saved! ")
