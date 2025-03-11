@@ -7,6 +7,10 @@ import random
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import matplotlib
+import os
+import datetime
+import math
+import shutil
 matplotlib.use('Agg')  # 使用非交互式后端
 
 # ABC 算法参数
@@ -29,6 +33,9 @@ MIN_STEP = 0.01
 MAX_STEP = 0.02
 BASE_FOOD_SIZE = 50
 
+# 记录参数
+BEE_MOVEMENT_DISAPPEAR_TIME = 10000 # 蜜蜂移动消失时间 (毫秒)
+BEE_HISTORY_LENGTH = 200  # 每个蜜蜂记录的历史位置数
 
 class FoodSource:
     def __init__(self, position):
@@ -43,9 +50,17 @@ class Bee:
         self.food_sources = food_sources
         self.has_food = False
         self.known_empty_sources = set()  # 只记录自己发现的无蜜蜜源
+        self.history = []  # 新增：记录位置和时间的列表 (pos, timestamp)
 
     def reset_knowledge(self):
         self.known_empty_sources.clear()
+
+    def update_history(self, frame_time):
+        # 添加当前位置和时间戳
+        self.history.append((self.position.copy(), frame_time))
+        # 保持历史记录长度
+        if len(self.history) > math.ceil(BEE_MOVEMENT_DISAPPEAR_TIME / FRAME_TIME):
+            self.history.pop(0)
 
 # 修改蜜源初始化部分
 def generate_valid_position(existing_positions, min_dist=0.1):
@@ -71,9 +86,13 @@ def fitness_function(pos):
 
 class ABCAlgorithm:
     def __init__(self, food_sources):
+        self.start_time = datetime.datetime.now()
         self.bees = [Bee(food_sources) for _ in range(NUM_BEES)]
         self.food_sources = food_sources
         self.frame_count = 0
+
+    def get_current_time(self):
+        return (datetime.datetime.now() - self.start_time).total_seconds() * 1000  # 毫秒
 
     def update_nectar(self):
         self.frame_count += 1
@@ -166,6 +185,12 @@ class ABCAlgorithm:
                 fs.recovery_timer = 1000 / FRAME_TIME * NECTAR_RECOVERY_TIME
 
 
+# 在初始化算法和画布前添加清理代码
+if os.path.exists('bee_flight.gif'):
+    os.remove('bee_flight.gif')
+if os.path.exists('sim_figures'):
+    shutil.rmtree('sim_figures')
+
 # 初始化算法和画布
 abc = ABCAlgorithm(food_sources)
 fig, ax = plt.subplots(figsize=FIG_SIZE)
@@ -178,12 +203,13 @@ scatter = ax.scatter(
     [], [], 
     c='yellow', 
     s=50, 
-    alpha=0.2,  # 初始透明度
-    edgecolors='white'
+    alpha=0.2,
+    edgecolors='white',
+    label='Bees'  # 添加标签
 )
 best_bee, = ax.plot([], [], 'ro', markersize=12, alpha=0.8)
 
-# 添加图形元素
+# 恢复主图形的元素绘制
 # 蜂巢（绿色方块）
 ax.plot(HIVE_POS[0], HIVE_POS[1], 'gs', markersize=15, label='Hive')
 
@@ -192,19 +218,110 @@ food_scatter = ax.scatter(
     [fs.position[0] for fs in food_sources],
     [fs.position[1] for fs in food_sources],
     c='#1E90FF', 
-    s=[fs.nectar/NECTAR_FULL*BASE_FOOD_SIZE*2 for fs in food_sources],  # 大小映射
+    s=[fs.nectar/NECTAR_FULL*BASE_FOOD_SIZE*2 for fs in food_sources],
     edgecolors='white'
 )
-# 访问点（红色三角形）
-for ap in AP_POSITIONS:
-    ax.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8, label='AP')
 
-# 添加蜜量文字标签
+# 访问点（红色三角形）
+for i, ap in enumerate(AP_POSITIONS):
+    label = 'AP' if i == 0 else None  # 只为第一个AP添加标签
+    ax.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8, label=label)
+
+# 恢复蜜量文字标签的更新
 food_labels = [ax.text(fs.position[0], fs.position[1]+0.02, str(fs.nectar), 
                       ha='center', va='bottom', color='white', fontsize=8)
               for fs in food_sources]
 
+# 修改图例元素设置
+legend_elements = [
+    plt.Line2D([0], [0], 
+               marker='o', 
+               color='none',  # 透明线条
+               markerfacecolor='yellow',
+               markersize=10, 
+               label='Bees',
+               alpha=0.7,
+               markeredgewidth=0),  # 移除边缘
+    plt.Line2D([0], [0],
+               marker='o',
+               color='none',
+               markerfacecolor='#1E90FF',
+               markersize=10,
+               label='Food',
+               markeredgewidth=0),
+    plt.Line2D([0], [0],
+               marker='s', 
+               color='none',
+               markerfacecolor='green',
+               markersize=10,
+               label='Hive',
+               markeredgewidth=0),
+    plt.Line2D([0], [0],
+               marker='^', 
+               color='none',
+               markerfacecolor='red',
+               markersize=10,
+               label='AP',
+               markeredgewidth=0)
+]
+ax.legend(handles=legend_elements, loc='upper right')
+
+# 修改轨迹保存部分
+def save_bee_trails(frame, current_time):
+    os.makedirs('sim_figures', exist_ok=True)
+    
+    for i, bee in enumerate(abc.bees):
+        # 创建每个蜜蜂的专属文件夹
+        bee_dir = f'sim_figures/bee_{i:02d}'
+        os.makedirs(bee_dir, exist_ok=True)
+        
+        # 创建新画布
+        fig_bee, ax_bee = plt.subplots(figsize=FIG_SIZE)
+        ax_bee.set_xlim(0, 1)
+        ax_bee.set_ylim(0, 1)
+        ax_bee.set_facecolor('black')
+        
+        # 只绘制访问点
+        for ap in AP_POSITIONS:
+            ax_bee.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8)
+        
+        # 绘制该蜜蜂的轨迹
+        trail_positions = []
+        trail_alphas = []
+        for pos, timestamp in bee.history:
+            age = current_time - timestamp
+            alpha = max(0, 1 - age/BEE_MOVEMENT_DISAPPEAR_TIME)
+            if alpha > 0:
+                trail_positions.append(pos)
+                trail_alphas.append(alpha)
+        
+        if trail_positions:
+            ax_bee.scatter(
+                [p[0] for p in trail_positions],
+                [p[1] for p in trail_positions],
+                c="yellow", 
+                s=20,
+                alpha=trail_alphas,
+                edgecolors='none'
+            )
+        
+        # 保存并关闭
+        plt.savefig(f'{bee_dir}/trail_{frame:04d}.png', dpi=150, bbox_inches='tight')
+        plt.close(fig_bee)
+
+
+
 def update(frame):
+    current_time = abc.get_current_time()
+    
+    # 更新所有蜜蜂的历史记录
+    for bee in abc.bees:
+        bee.update_history(current_time)
+    
+    # 保存一次轨迹图（共保存10次）
+    if frame % (GIF_FRAMES//10) == 0:
+        save_bee_trails(frame, current_time)
+    
     abc.update_positions()
     
     # 更新蜜蜂位置和透明度
@@ -228,7 +345,7 @@ def update(frame):
     food_scatter.set_sizes(food_sizes)
     food_scatter.set_alpha(food_alphas)
 
-    # 更新蜜量标签
+    # 恢复蜜量标签更新
     for fs, label in zip(abc.food_sources, food_labels):
         if fs.nectar > 0: 
             label.set_text(str(fs.nectar))
@@ -255,7 +372,9 @@ ani.save('bee_flight.gif',
          fps=1000//FRAME_TIME,  # 根据帧间隔计算正确fps
          progress_callback=lambda i, n: print(f'进度: {i+1}/{n} 帧', end='\r'))
 print("\n动画保存完成!")
-plt.close(fig)  # 关闭图形窗口
-
-# 显示动画
+plt.close(fig)
 plt.show()
+
+# 在文件最后添加（保存完成后打开文件夹）
+print("正在打开结果文件夹...")
+
