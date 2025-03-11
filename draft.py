@@ -1,3 +1,10 @@
+###################
+# 我们一步一步来。现在  是空的。我想定义AP类，其生成信号x(t) = Ae^jωt 
+###################
+
+
+
+
 import numpy as np
 import matplotlib.pyplot as plt
 import os, shutil
