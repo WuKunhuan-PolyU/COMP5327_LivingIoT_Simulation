@@ -41,7 +41,7 @@ AP_SIGNAL_STRENGTH = 28 # dBm
 
 # Simulation Parameters
 FRAME_TIME = 50    # ms
-SIM_TIME = 6000   # ms
+SIM_TIME = 2000   # ms
 NUM_FRAMES = round(SIM_TIME / FRAME_TIME)
 
 # Bee Parameters
@@ -472,9 +472,6 @@ class Simulation:
         self.food_sources = food_sources
         self.frame_count = 0
 
-    def get_current_time(self):
-        return (datetime.datetime.now() - self.start_time).total_seconds() * 1000
-
     def update_nectar(self):
         self.frame_count += 1
         for _, fs in enumerate(self.food_sources):
@@ -702,7 +699,7 @@ def find_nlos():
                     total_atten = fs_loss + attenuation
                     debug_mode = (x, y) in debug_points
                     if debug_mode:
-                        print(f"\nAttenuation AP{ap.ap_id} @ ({x},{y})")
+                        print(f"\nAttenuation AP{ap.ap_id} @ ({round(x,2)},{round(y,2)})")
                         print(f"├─ LOS Vector: {los_vector}")
                         print(f"├─ LOS Distance: {los_distance:.2f}m")
                         print(f"├─ Free Space Loss: {fs_loss:.2f}dB")
@@ -780,7 +777,7 @@ def plot_attenuation_map(ap_id, attenuation_grid):
 
 find_nlos()# 测试AP0的中心点
 
-exit(1)
+
 
 
 ## Start Simulation
@@ -849,21 +846,20 @@ ax.legend(handles=legend_elements, loc='upper right')
 # Start the AP phase shift algorithm
 
 # Update the frame
-current_frame = 0
+prev_save_time = 0
+current_frame_id = 0
+trail_save_num = 10
+if (NUM_FRAMES < 100): 
+    trail_save_num = math.ceil(NUM_FRAMES / 10)
+
 def update(frame):
-    global current_frame
-    current_frame = frame
-
-    # For each bee, receive signals from APs
-    # Detect any 
-
+    global current_frame_id
+    current_frame_id = frame
 
     # Update bee history and save the bee trail
     def save_bee_trails(frame, current_time):
         os.makedirs('sim_figures', exist_ok=True)
         for i, bee in enumerate(sim.bees):
-
-            # Create a unique folder for each bee
             bee_dir = f'sim_figures/bee_{i:02d}'
             os.makedirs(bee_dir, exist_ok=True)
             
@@ -896,15 +892,16 @@ def update(frame):
                     alpha=trail_alphas,
                     edgecolors='none'
                 )
-            
-            # Save and close
-            plt.savefig(f'{bee_dir}/trail_{frame:04d}.png', dpi=150, bbox_inches='tight')
+            global prev_save_time
+            plt.savefig(f'{bee_dir}/trail_{prev_save_time}ms-{current_time}ms.png', dpi=150, bbox_inches='tight')
             plt.close(fig_bee)
-    current_time = sim.get_current_time()
     for bee in sim.bees:
-        bee.update_position_history(current_time)
-    if (frame + 1) % (NUM_FRAMES // 10) == 0:
-        save_bee_trails(frame+1, current_time)
+        bee.update_position_history(current_frame_id * FRAME_TIME)
+    if (frame + 1) % (NUM_FRAMES // trail_save_num) == 0:
+        current_time = current_frame_id * FRAME_TIME
+        save_bee_trails(frame+1, current_time)  
+        global prev_save_time
+        prev_save_time = current_time + FRAME_TIME
     
     # Update the bees and nectars (and their displays)
     sim.update_bees()
@@ -935,7 +932,7 @@ def update(frame):
     return [bee_scatter, food_scatter] + food_labels
 
 # Save the animation
-print("Generating simulation amination ...")
+print("\nGenerating simulation amination ...")
 ani = FuncAnimation(
     fig, 
     update, 
