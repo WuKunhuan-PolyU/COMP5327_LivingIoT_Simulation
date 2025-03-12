@@ -1,3 +1,41 @@
+
+
+
+
+
+The key insight is that, when M
+j 2 aj <a1, which is true 
+in most line-of-sight scenarios like the farm, the error in our estimate of the angle with respect to the AP, which is |
+ϕ−ϕ1 |, is bounded. Moreover, this error decreases linearly as the 
+number of antennas increases. To verify this intuition, we 
+perform a simulation where we compute this error by chang-
+ing the number of antennas. We repeat this for increasing
+multipath ratios R, ratio of the sum of the amplitudes of all
+NLOS paths with respect to the amplitude of the LOS path.
+Assuming that the angles of indirect paths are uniformly dis-
+tributed, Fig. 7 shows the mean error as a function of these
+two parameters. The plot shows that the error is less than
+10◦ when using four antennas even if the total amplitude of
+all NLOS path is 60% of the amplitude of LOS path. With ive
+antennas, we can get a similar error even when this ratio is
+close to 0.95. This shows that by increasing the number of
+antennas at the AP, we can reduce the error due to NLOS
+paths and achieve an accurate angle estimation.
+
+For our experiments, each AP
+consists of one USRP-N210 connected to a four way power
+splitter followed by three phase shifters, each of which in-
+troduces a phase shift controlled by an NI myDAQ digital-
+analog converter. Along with the original signal, the four
+outputs are ampliied to 28 dBm by a Qorvo RF5110G power
+ampliier and then connected to four 2 dBi monopole anten-
+nas separated by 12 cm each. The cable lengths are carefully
+calibrated so that no extra phase ofset is introduced.
+
+------------
+
+
+
 # Living IoT Paper
 
 Living IoT’s localization system employs APs which transmit
