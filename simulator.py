@@ -29,7 +29,7 @@ AP_PREAMBLES = [(1,0,1,0,1,0,1,0), (1,1,0,0,1,1,0,0)]
 # numbers are chosen for the ease of simulation
 AP_SWEEP_T = 50           # time (ms) per sweep, including preamble <- from the paper
 AP_SWEEP_PREAMBLE_T = 5   # time (ms) of preamble in a sweep <- self chosen
-AP_PHASESHIFT_NUM = 90    # degrees diff per antenna per phase shift <- self chosen
+AP_PHASESHIFT_NUM = 90    # number of phase shifts beside preamble per sweep <- self chosen
 # in (50, 5, 90) setting, each phase shift takes 0.5ms
 # as TDMA is used, the signals are transmitted in a time-division manner
 # for example, if there are 2 APs, and the sweep time is 50ms
@@ -62,6 +62,10 @@ NECTAR_EMPTY_DISCOVERY_DISTANCE = 10 * STEP_SIZE
 OVERLAP_DISTANCE_ERROR = 3 * STEP_SIZE
 MOVEMENT_DISAPPEAR_TIME = 10000 # ms
 
+# 新增全局参数
+AP_SAMPLE_RATE = 40 * AP_FREQ  # 40倍过采样
+AP_SIGNAL_AMPLITUDE = 10**(AP_SIGNAL_STRENGTH / 20)  # 转换dBm为线性振幅
+
 # Class definitions
 class Food:
     def __init__(self, position):
@@ -77,6 +81,7 @@ class Bee:
         self.has_food = False
         self.known_empty_sources = set() # Local memory of empty food sources
         self.history = []  # Record position and time
+        self.signal_memory = []  # 存储最近3个周期的信号数据
 
     def reset_knowledge(self):
         self.known_empty_sources.clear()
@@ -86,17 +91,32 @@ class Bee:
         if len(self.history) > math.ceil(MOVEMENT_DISAPPEAR_TIME / FRAME_TIME):
             self.history.pop(0)
 
+    def receive_signal(self, ap_id, timestamps, samples):
+        """存储接收到的信号数据"""
+        if len(self.signal_memory) >= 3:
+            self.signal_memory.pop(0)
+        self.signal_memory.append({
+            'ap_id': ap_id,
+            'timestamps': timestamps,
+            'samples': samples
+        })
+    
+    def sample_position_history(self):
+        pass
+    
+    def get_estimated_position(self):
+        pass
+
 class AP:
     def __init__(self, ap_id, 
                  location, # (x (in m), y (in m))
-                 antenna_num, 
-                 # assume the antennas are distributed in a line, and the center is the location
+                 antenna_num, # assume the antennas are distributed in a line, and the center is the location
                  frequency, # in Hz
                  preamble_signal, 
                  antenna_direction = 0, # radians, counterclockwise from the positive x-axis
                  sweep_time = 50, # in ms
                  preamble_duration = 5, # in ms
-                 phase_shift_num = 90, 
+                 phase_shifts_per_sweep = 90,  # 根据论文Algorithm 1命名
                  ):
         self.ap_id = ap_id
         self.location = np.array(location)
@@ -110,10 +130,7 @@ class AP:
         self.antenna_direction = antenna_direction
         self.wavelength = 3e8 / frequency  # Speed of light / frequency, in meters
         
-        # should be around 33cm for 915MHz
-        self.antenna_spacing = self.wavelength / 2  # Half wavelength spacing, in meters
-
-        # calculate the locations of the antennas
+        self.antenna_spacing = self.wavelength / 2  # Half wavelength spacing, in meters, should be around 33cm for 915MHz
         antenna_direction_vector = np.array([np.cos(antenna_direction), np.sin(antenna_direction)])
         self.antenna_locations = [
             self.location + self.antenna_spacing * (i - (self.antenna_num-1)/2) * antenna_direction_vector
@@ -122,30 +139,104 @@ class AP:
         
         self.sweep_time = sweep_time
         self.preamble_duration = preamble_duration
-        self.phase_shift_num = phase_shift_num
 
+        # 波束成形相关参数
+        self.current_theta = -np.pi/2  # 当前波束角度
+        self.phase_shifts_per_sweep = phase_shifts_per_sweep 
+        self.phase_step = np.pi / self.phase_shifts_per_sweep  # δ = π/90 ≈ 2°
+        self.antenna_phases = [0.0] * (self.antenna_num + 1)  # 天线编号从1开始
+
+        # Run the tests
         self.test_signal()
+        self.signal_at_position((0.0, 0.0))
 
-    def effect_nlos(self): 
-        pass
+    def calculate_attenuation(self, position):
+        """根据位置获取总衰减"""
+        x = position[0] * FIELD_SIZE
+        y = position[1] * FIELD_SIZE / FIELD_ASPECT_RATIO
+        with open(f'sim_stats/AP_{self.ap_id}/nlos_attenuation.csv') as f:
+            for line in f:
+                if line.startswith(f"{int(x)},{int(y)}"):
+                    return float(line.split(',')[2])
+        return 0  # 默认无衰减
+    
+    def transmit_signal(self, bees, current_time):
+        """改进的TDMA信号传输"""
+        # 重置波束角度
+        self.current_theta = -np.pi/2  # 每次传输都从-π/2开始
+        
+        # 每个相位步长持续时间
+        phase_duration = (self.sweep_time - self.preamble_duration) / self.phase_shifts_per_sweep
+        
+        # 分阶段生成信号
+        timestamps = []
+        samples = []
+        
+        # 前导码阶段
+        preamble_ts = np.arange(current_time, current_time+self.preamble_duration, 1000/AP_SAMPLE_RATE)
+        timestamps.extend(preamble_ts)
+        samples.extend([self.sample_signal(t) for t in preamble_ts])
+        
+        # 相位扫描阶段
+        for i in range(self.phase_shifts_per_sweep):
+            # 更新波束角度
+            self.current_theta += self.phase_step
+            self.current_theta = np.clip(self.current_theta, -np.pi/2, np.pi/2)
+            
+            # 生成当前角度下的信号
+            phase_ts = np.arange(
+                current_time + self.preamble_duration + i*phase_duration,
+                current_time + self.preamble_duration + (i+1)*phase_duration,
+                1000/AP_SAMPLE_RATE
+            )
+            timestamps.extend(phase_ts)
+            samples.extend([self.sample_signal(t) for t in phase_ts])
+        
+        # 发送给所有蜜蜂
+        for bee in bees:
+            attenuation = self.calculate_attenuation(bee.position)
+            amp_scale = AP_SIGNAL_AMPLITUDE * 10**(-attenuation/20)
+            bee.receive_signal(self.ap_id, timestamps, [s*amp_scale for s in samples])
 
-    def sample_signal(self, 
-                      timestamp, # in ms
-                      location = None # (x, y) in m
-                      ): 
-        '''
-        Given a timestamp, return the generated signal amplitude
-        '''
-        if (self.signal_start == None or timestamp < self.signal_start): 
+    def calculate_beamforming_phase(self, position):
+        """根据论文公式计算波束成形相位差"""
+        # 计算到达角θ（相对于天线阵列方向）
+        vec = position - self.location
+        theta = np.arctan2(vec[1], vec[0]) - self.antenna_direction
+        theta = np.clip(theta, -np.pi/2, np.pi/2)
+        
+        # 根据论文公式设置相位（天线编号从2开始）
+        for j in range(2, self.antenna_num+1):
+            self.antenna_phases[j-1] = (j-1) * np.pi * np.sin(theta)
+        
+        return sum(self.antenna_phases[1:])  # 合成相位（忽略0号天线）
+
+    def sample_signal(self, timestamp, position=None):
+        """生成带波束成形效果的信号
+        信号组成：全局相位偏移 + 波束成形相位差
+                  ┌─────────────┐
+        时间 ──→ │ 相位调制器  │──→ 合成信号
+                  └─────┬───┬───┘
+                    全局偏移 │
+                           波束成形相位差
+        """
+        # 基础相位偏移（TDMA调度引起）
+        phase_shift = np.radians(self.current_theta)
+        
+        if position is not None:
+            delta_phase = self.calculate_beamforming_phase(position)
+            phase_shift += delta_phase
+            # 记录波束成形相位差（用于调试）
+            self.last_beamforming_phase = delta_phase
+        
+        # 原始信号生成
+        if (self.signal_start is None or timestamp < self.signal_start):
             return 0
         elif (timestamp < self.signal_start + self.preamble_duration): 
             return self.preamble[int((timestamp - self.signal_start) / self.preamble_duration * len(self.preamble))]
         else: 
             time = (timestamp - self.signal_start - self.preamble_duration)
-            phase = 2 * np.pi * self.freq * (time * 1e-3)
-            amp = np.sin(phase)
-            # print  (f"time: {time}, phase: {phase}, amp: {amp}")
-            return amp
+            return np.sin(2 * np.pi * self.freq * (time * 1e-3) + phase_shift)
     
     def sample_signal_range(self, 
                             start, # in ms
@@ -157,15 +248,13 @@ class AP:
         Given a timestamp, return the sampled signal amplitude
         '''
         all_timestamps = np.arange(start, end, step)
-        # print  (f"all_timestamps ({len(all_timestamps)}): {all_timestamps}")
         samples = [self.sample_signal(t, location) for t in all_timestamps]
-        # print  (f"samples ({len(samples)}): {samples}")
         return samples
-
+    
     def test_signal(self):
         """
         Generate dual-view signal analysis with separated time scales
-        Save to sim_figures/AP_{ap_id}/dual_scale_analysis.png
+        Save to sim_figures/AP_{ap_id}/test_signal.png
         """
         # Find the signal period
         period_ns = 1e9 / self.freq  # in ns
@@ -179,8 +268,8 @@ class AP:
         # Generate test signal data
         preamble_t = np.linspace(0, preamble_duration_ms, samples_preamble)
         signal_t = np.linspace(preamble_duration_ms, 
-                             preamble_duration_ms + signal_duration_ns*1e-6,  # in ns to ms
-                             3*samples_per_period)
+                             preamble_duration_ms + signal_duration_ns * 1e-6,  # in ns to ms
+                             3 * samples_per_period)
         preamble_data = [self.sample_signal(t) for t in preamble_t]
         signal_data = [self.sample_signal(t) for t in signal_t]
 
@@ -223,7 +312,7 @@ class AP:
         ax2.set_ylim(-1.1, 1.1)
         output_dir = f'sim_figures/AP_{self.ap_id}'
         os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(os.path.join(output_dir, "dual_scale_analysis.png"), 
+        plt.savefig(os.path.join(output_dir, "test_signal.png"), 
                   dpi=300, bbox_inches='tight')
         plt.close()
         print (f"\nAccess Point {self.ap_id} Statistics:")
@@ -262,6 +351,119 @@ class AP:
         
         # 计算接收功率
         return AP_SIGNAL_STRENGTH - attenuation
+
+    def signal_at_position(self, norm_pos):
+        """在指定位置验证信号特征"""
+        position = np.array(norm_pos)
+        
+        # 生成时间序列（一个sweep周期）
+        timestamps = np.arange(0, self.sweep_time, 0.1)  # 0.1ms分辨率
+        
+        # 计算各分量
+        original = []
+        attenuated = []
+        phases = []
+        
+        for t in timestamps:
+            # 原始信号（无衰减）
+            amp = self.sample_signal(t, position=None)  # 禁用波束成形
+            original.append(amp)
+            
+            # 衰减计算
+            attenuation = self.calculate_attenuation(position)
+            amp_scale = AP_SIGNAL_AMPLITUDE * 10**(-attenuation/20)
+            
+            # 实际接收信号（含波束成形和衰减）
+            actual_amp = self.sample_signal(t, position) * amp_scale
+            attenuated.append(actual_amp)
+            
+            # 记录相位
+            phase_shift = self.current_theta
+            phases.append(phase_shift)
+            
+            # 更新相位（模拟实时变化）
+            if t >= self.preamble_duration:  # 仅在前导码之后更新相位
+                if (t - self.preamble_duration) % (self.sweep_time/self.phase_shifts_per_sweep) == 0:
+                    self.current_theta += self.phase_step
+                    self.current_theta = np.clip(self.current_theta, -np.pi/2, np.pi/2)
+        
+        # 绘图
+        plt.figure(figsize=(12, 8))
+        
+        # 原始信号
+        plt.subplot(3, 1, 1)
+        plt.plot(timestamps, original, label='Original Signal')
+        plt.title(f"AP{self.ap_id} Signal Components @ ({norm_pos[0]:.2f}, {norm_pos[1]:.2f})")
+        plt.ylabel("Amplitude (V)")
+        plt.legend()
+        
+        # 衰减后信号
+        plt.subplot(3, 1, 2)
+        plt.plot(timestamps, attenuated, color='orange', label='Attenuated Signal')
+        plt.ylabel("Amplitude (V)")
+        plt.legend()
+        
+        # 相位变化
+        theta_values = []
+        for t in timestamps:
+            if t < self.preamble_duration:
+                theta_values.append(-np.pi/2)  # 前导码阶段固定角度
+            else:
+                # 计算扫描阶段的线性变化
+                scan_progress = (t - self.preamble_duration) / (self.sweep_time - self.preamble_duration)
+                theta = -np.pi/2 + scan_progress * np.pi
+                theta_values.append(theta)
+
+        # 相位变化图
+        plt.subplot(3, 1, 3)
+        for j in range(2, self.antenna_num+1):
+            phases = [(j-1)*np.sin(theta) for theta in theta_values]  # 以π为单位
+            
+            # 分阶段绘制
+            # 前导码阶段（灰色背景区域）
+            preamble_mask = [t < self.preamble_duration for t in timestamps]
+            plt.plot(np.array(timestamps)[preamble_mask], 
+                    np.array(phases)[preamble_mask], 
+                    color='gray', 
+                    linewidth=1.5,
+                    alpha=0)
+            
+            # 扫描阶段（彩色实线）
+            scan_mask = [t >= self.preamble_duration for t in timestamps]
+            plt.plot(np.array(timestamps)[scan_mask], 
+                    np.array(phases)[scan_mask], 
+                    linewidth=1.5,
+                    label=f'Antenna {j} Phase')
+
+        # 设置纵坐标刻度为π的倍数
+        max_phase = (self.antenna_num-1)  # 最大相位值（π的倍数）
+        y_ticks = np.arange(-max_phase, max_phase+1)
+        plt.yticks(y_ticks, [f'{x}π' if x !=0 else '0' for x in y_ticks])
+        plt.xlabel("Time (ms)")
+        plt.ylabel("Phase (π rad)")
+        plt.grid(alpha=0.3)
+        plt.legend()
+
+        # 添加前导码区域标注
+        plt.axvspan(0, self.preamble_duration, color='gray', alpha=0.2, label='Preamble')
+        
+        plt.tight_layout()
+        output_dir = f'sim_figures/AP_{self.ap_id}'
+        os.makedirs(output_dir, exist_ok=True)
+        plt.savefig(os.path.join(output_dir, f"signal_at_position_{norm_pos[0]:.2f}_{norm_pos[1]:.2f}.png"), 
+                  dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def statistics(self):
+        print (f"\nAccess Point {self.ap_id} Statistics:")
+        print (f"├─ Location: {[round(i, 3) for i in self.location]}")
+        print (f"├─ Preamble Duration: {self.preamble_duration}ms")
+        print (f"├─ Carrier Frequency: {self.freq/1e6}MHz")
+        print (f"├─ Single Period: {1/(self.freq)*1e9:.4f}ns")
+        print (f"└─ Antenna Configuration:")
+        print (f"   ├─ Number: {self.antenna_num}")
+        print (f"   ├─ Spacing: {self.antenna_spacing:.4f}m")
+        print (f"   └─ Direction: {self.antenna_direction:.2f} radians")
 
 class Simulation:
     def __init__(self, food_sources):
@@ -356,6 +558,16 @@ class Simulation:
                 fs.nectar = -1
                 fs.recovery_timer = 1000 / FRAME_TIME * NECTAR_EXPECTED_RECOVERY_TIME * (0.8 + 0.4 * random.random())
 
+    def run_frame(self, frame):
+        current_time = frame * FRAME_TIME
+        
+        # TDMA调度：每个AP在分配的时间窗口发送
+        for i, ap in enumerate(APs):
+            if current_time % (len(APs)*ap.sweep_time) == i*ap.sweep_time:
+                ap.transmit_signal(self.bees, current_time)
+        
+        # ...保持原有运动逻辑不变...
+
 # Generate APs [STATIC]
 APs = []
 for i, pos in enumerate(AP_POS):
@@ -366,7 +578,7 @@ for i, pos in enumerate(AP_POS):
                   AP_PREAMBLES[i], 
                   sweep_time = AP_SWEEP_T, 
                   preamble_duration = AP_SWEEP_PREAMBLE_T, 
-                  phase_shift_num = AP_PHASESHIFT_NUM)
+                  phase_shifts_per_sweep = AP_PHASESHIFT_NUM)
     # All APs are coarsely synchronized using TDMA, 
     # given the same frequency, all APs uniformly distribute the AP_SWEEP_T
     # so that the signal generation is coherent
@@ -388,7 +600,7 @@ for _ in range(NUM_FOOD_SOURCES):
     all_positions.append(pos)
     food_sources.append(Food(pos))
 
-# 在创建AP和食物源之后，调用find_nlos_first_time之前添加：
+# Output the environment topology
 print("\nEnvironment Topology: ")
 print(f"├─ Field Size: {FIELD_SIZE}x{FIELD_SIZE/FIELD_ASPECT_RATIO:.1f} meters")
 print(f"├─ AP Positions (Total {len(APs)}):")
@@ -411,11 +623,10 @@ for i, fs in enumerate(food_sources):
 print ()
 
 # Find NLOS [STATIC]
-# 修改反射系数为穿透损耗
-PENETRATION_LOSS_HIVE = 15  # 原NLOS_REFLECT_HIVE = 0.5
-PENETRATION_LOSS_AP = 10    # 原NLOS_REFLECT_AP = 0.2
-PENETRATION_LOSS_FOOD = 5   # 原NLOS_REFLECT_FOOD = 0.1
-PATH_OBSTACLE_DISTANCE = 1  # 路径1米内视为穿透
+PENETRATION_LOSS_HIVE = 15
+PENETRATION_LOSS_AP = 10
+PENETRATION_LOSS_FOOD = 5
+PATH_OBSTACLE_DISTANCE = 1  # Along the path, 1m inside is considered penetrated
 OBSCATLE_ATTENUATION_FACTOR = 50
 FREESPACE_ATTENUATION_FACTOR = 20
 def find_nlos():
@@ -460,55 +671,43 @@ def find_nlos():
                     current_pos = np.array([x, y])
                     total_atten = 0
                     
-                    # === Debug Output ===
-                    debug_mode = (x, y) in debug_points
-                    
                     # Calculate the LOS direction to the AP
                     los_vector = current_pos - ap.location
-                    los_angle = np.arctan2(los_vector[1], los_vector[0])
                     los_distance = np.linalg.norm(los_vector)
                     if los_distance == 0:
                         continue
                     fs_loss = np.log10(4 * np.pi * los_distance * ap.freq / 3e8) * FREESPACE_ATTENUATION_FACTOR
                     
-                    # === Debug Output ===
-                    if debug_mode:
-                        print(f"\n=== Debug AP{ap.ap_id} @ ({x},{y}) ===")
-                        print(f"LOS Vector: {los_vector}")
-                        print(f"LOS Distance: {los_distance:.2f}m")
-                        print(f"Free Space Loss: {fs_loss:.2f}dB")
-                    
                     # Calculate attenuation components
                     attenuation = 0.0
-                    for obs_type, obs_pos, loss in obstacles:
+                    for _, obs_pos, loss in obstacles:
                         if np.array_equal(obs_pos, ap.location):
                             continue
                         
                         # 计算障碍物到AP-接收点连线的距离
                         ap_pos = ap.location
                         recv_pos = np.array([x, y])
-                        
-                        # 向量计算
                         vec_AP2Recv = recv_pos - ap_pos
                         vec_AP2Obs = obs_pos - ap_pos
                         
-                        # 计算投影参数t (判断是否在路径延长线上)
+                        # Find the projection parameter t
                         t = np.dot(vec_AP2Obs, vec_AP2Recv) / np.dot(vec_AP2Recv, vec_AP2Recv)
-                        
-                        # 垂直距离计算
-                        distance = np.linalg.norm(np.cross(vec_AP2Recv, vec_AP2Obs)) / np.linalg.norm(vec_AP2Recv)
-                        
+                        vec_AP2Recv_3d = np.append(vec_AP2Recv, 0)
+                        vec_AP2Obs_3d = np.append(vec_AP2Obs, 0)
+                        cross_product = np.cross(vec_AP2Recv_3d, vec_AP2Obs_3d)
+                        distance = np.linalg.norm(cross_product) / np.linalg.norm(vec_AP2Recv)
                         if (0 <= t <= 1) and (distance < PATH_OBSTACLE_DISTANCE):
                             attenuation += loss
                     
                     total_atten = fs_loss + attenuation
-                    
-                    # === Final Debug Output ===
+                    debug_mode = (x, y) in debug_points
                     if debug_mode:
-                        print(f"\nTotal Attenuation Breakdown:")
-                        print(f"- Free Space Loss: {fs_loss:.2f}dB")
-                        print(f"- NLOS Attenuation: {attenuation:.2f}dB")
-                        print(f"= Total Attenuation: {total_atten:.2f}dB\n")
+                        print(f"\nAttenuation AP{ap.ap_id} @ ({x},{y})")
+                        print(f"├─ LOS Vector: {los_vector}")
+                        print(f"├─ LOS Distance: {los_distance:.2f}m")
+                        print(f"├─ Free Space Loss: {fs_loss:.2f}dB")
+                        print(f"├─ NLOS Attenuation: {attenuation:.2f}dB")
+                        print(f"└─ Total Attenuation: {total_atten:.2f}dB")
                     
                     attenuation_grid[int(x), int(y)] = total_atten
                     f.write(f"{x},{y},{total_atten:.1f}\n")
@@ -579,7 +778,7 @@ def plot_attenuation_map(ap_id, attenuation_grid):
               dpi=300, bbox_inches='tight')
     plt.close()
 
-find_nlos()
+find_nlos()# 测试AP0的中心点
 
 exit(1)
 
