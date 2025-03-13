@@ -7,10 +7,8 @@ import os, datetime, math, shutil, random
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import matplotlib.gridspec as gridspec
-import threading  # 添加线程支持
-import time  # 添加时间模块
-import gc  # 添加垃圾回收支持
-import sys  # 添加sys模块
+import threading, time
+from matplotlib.colors import ListedColormap
 
 if os.path.exists('sim.gif'):
     os.remove('sim.gif')
@@ -21,8 +19,8 @@ if os.path.exists('sim_figures'):
 # Environment and Display Parameters
 NUM_BEES = 2
 NUM_FOOD_SOURCES = 5  # randomly distributed in the field
-HIVE_POS = (0.5, 0.1)                  # normalized
-AP_POS = [(0.25, 0.5), (0.75, 0.5)]    # normalized
+HIVE_POS_NORM = (0.5, 0.1)                  # normalized
+AP_POS_NORM = [(0.25, 0.5), (0.75, 0.5)]    # normalized
 FIG_SIZE = (8, 8)
 NECTAR_DISPLAY_SIZE = 50
 NECTAR_EXPECTED_STORAGE = 15
@@ -33,7 +31,7 @@ AP_PREAMBLES = [(1,0,1,0,1,0,1,0), (1,1,0,0,1,1,0,0)]
 # numbers are chosen for the ease of simulation
 AP_SWEEP_T = 50
 AP_SWEEP_PREAMBLE_T = 5   # time (ms) of preamble in a sweep <- self chosen
-AP_PHASESHIFT_NUM = 30  # 减少相位变化次数
+AP_PHASESHIFT_NUM = 50
 # in (50, 5, 90) setting, each phase shift takes 0.5ms
 # as TDMA is used, the signals are transmitted in a time-division manner
 # for example, if there are 2 APs, and the sweep time is 50ms
@@ -71,27 +69,27 @@ debug_print_lock = threading.Lock()
 
 # Class definitions
 class Food:
-    def __init__(self, position):
-        self.position = position
+    def __init__(self, location):
+        self.location_normalized = location
         self.nectar = round((0.8 + 0.4 * random.random()) * NECTAR_EXPECTED_STORAGE)
         self.recovery_timer = 0
 
 class Bee:
     def __init__(self, food_sources):
-        self.position = np.array(HIVE_POS)
+        self.location_normalized = np.array(HIVE_POS_NORM)
         self.target_food = None
         self.food_sources = food_sources
         self.has_food = False
         self.known_empty_sources = set() # Local memory of empty food sources
-        self.history = []  # Record position and time
+        self.history = []  # Record location and time
         self.signal_memory = {}  # 结构: {ap_id: [(timestamp, sample), ...]}
         self.plotted_aps = set()  # 记录已绘制过的AP
 
     def reset_knowledge(self):
         self.known_empty_sources.clear()
 
-    def update_position_history(self, frame_time):
-        self.history.append((self.position.copy(), frame_time))
+    def update_location_history(self, frame_time):
+        self.history.append((self.location_normalized.copy(), frame_time))
         if len(self.history) > math.ceil(MOVEMENT_DISAPPEAR_TIME / FRAME_TIME):
             self.history.pop(0)
 
@@ -166,10 +164,10 @@ class Bee:
         print (f"├─ 样本数: {len(data)}")
         print (f"└─ 时间范围: {max(t)-min(t):.1f}ms")
 
-    def sample_position_history(self):
+    def sample_location_history(self):
         pass
     
-    def get_estimated_position(self):
+    def get_estimated_location(self):
         pass
 
 class AP:
@@ -185,6 +183,7 @@ class AP:
                  ):
         self.ap_id = ap_id
         self.location = np.array(location) # not normalized, in meters
+        self.location_normalized = self.location / FIELD_SIZE
         self.preamble = preamble_signal
 
         # used to calculate the signal
@@ -242,30 +241,31 @@ class AP:
                 attenuation_map[(x, y)] = float(atten)
         self.attenuation_map = attenuation_map
 
-    def calculate_beamforming_phase(self, position):
+    def calculate_beamforming_phase(self, location):
         '''
-        Calculate the beamforming phases for each antenna
-        This only makes up the ϕ component in y(t) = |ax(t) + ae^(j(ϕ−θ)) * x(t)|
+        修正后的波束成形相位计算（返回每个天线的相位列表）
         '''
-        antenna_phases = []
-        for antenna_loc in self.antenna_locations: 
-            distance = np.linalg.norm(position - antenna_loc) * FIELD_SIZE
+        phases = []
+        for antenna_loc in self.antenna_locations:
+            # 计算到天线的距离（米）
+            distance = np.linalg.norm(location - antenna_loc) * FIELD_SIZE
+            # 相位 = (距离 / 波长) * 2π
             phase = (distance / self.wavelength) * 2 * np.pi
-            antenna_phases.append(phase)
-        return antenna_phases
+            phases.append(phase)
+        return phases  # 返回所有天线的相位列表
 
-    def calculate_attenuation(self, position):
+    def calculate_attenuation(self, location):
         '''
         Retrieve the attenuation from the attenuation map
         '''
-        x = int(position[0] * FIELD_SIZE)
-        y = int(position[1] * FIELD_SIZE / FIELD_ASPECT_RATIO)
+        x = int(location[0] * FIELD_SIZE)
+        y = int(location[1] * FIELD_SIZE / FIELD_ASPECT_RATIO)
         return self.attenuation_map.get((x, y), 0.0)
     
-    def sample_signal(self, timestamp, position=None): 
+    def sample_signal(self, timestamp, location=None): 
         '''
         Generate a signal with beamforming effect given the timestamp
-        Signal composition: Global phase offset + beamforming phase difference
+        Signal comlocation: Global phase offset + beamforming phase difference
                  ┌───────────────┐
         Time ──→ │ Phase shifter │──→ Actual signal
                  └─────┬─────┬───┘
@@ -277,10 +277,10 @@ class AP:
         
         # Global phase offset (due to TDMA scheduling)
         # Calculate the beamformed phase shift <- all the antennas
-        # This only applies when the position is given
+        # This only applies when the location is given
         beam_phases = [0 for _ in range(self.antenna_num)]
-        if position is not None:
-            beam_phases = self.calculate_beamforming_phase(position)
+        if location is not None:
+            beam_phases = self.calculate_beamforming_phase(location)
         equivalent_signal_start = self.signal_start + self.sweep_time * ((timestamp - self.signal_start) // self.sweep_time)
         if (timestamp < equivalent_signal_start + self.preamble_duration): 
             # Preamble phase
@@ -316,17 +316,17 @@ class AP:
         
         # 为每个蜜蜂生成定制化信号
         for bee in bees:
-            if not hasattr(bee, 'position'):
+            if not hasattr(bee, 'location'):
                 print (f"  → 无效蜜蜂对象: {id(bee)}")
                 continue
             
             # 计算该蜜蜂的衰减系数
-            attenuation = self.calculate_attenuation(bee.position)
+            attenuation = self.calculate_attenuation(bee.location_normalized)
             amp_scale = 10**(-attenuation/20)
             
             # 生成针对该蜜蜂的信号
             samples = [
-                self.sample_signal(t, bee.position) * amp_scale
+                self.sample_signal(t, bee.location_normalized) * amp_scale
                 for t in timestamps
             ]
             
@@ -452,11 +452,11 @@ class AP:
             print (f"│   {'├─' if i < self.antenna_num - 1 else '└─'} Antenna {i} Location: {[round(i, 3) for i in self.antenna_locations[i]]}")
         print (f"└─ 3 Cycles Duration: {signal_duration_ns:.2f}ns")
 
-    def test_signal_charactertistics_at_position(self, norm_pos, save_fig=False):
+    def test_signal_charactertistics_at_location(self, norm_pos, save_fig=False):
         '''
-        Verify the signal characteristics at a specific position
+        Verify the signal characteristics at a specific location
         '''
-        position = np.array(norm_pos)
+        location = np.array(norm_pos)
         timestamps = np.arange(0, self.sweep_time, 0.1)  # 0.1ms resolution
         original = []
         attenuated = []
@@ -465,15 +465,15 @@ class AP:
         for t in timestamps:
 
             # Original signal (no attenuation)
-            amp = self.sample_signal(t, position)
+            amp = self.sample_signal(t, location)
             original.append(amp)
             
             # Actual received signal (with beamforming and attenuation)
             # The signal outputs for every antenna are ampliied to AP_SIGNAL_AMPLITUDE
             equivalent_signal_start = self.signal_start + self.sweep_time * ((t - self.signal_start) // self.sweep_time)
-            attenuation = self.calculate_attenuation(position)
+            attenuation = self.calculate_attenuation(location)
             amp_scale = 10 ** (-(AP_SIGNAL_AMPLITUDE - attenuation)/20)
-            actual_amp = self.sample_signal(t, position) * amp_scale
+            actual_amp = self.sample_signal(t, location) * amp_scale
             attenuated.append(actual_amp)
             # print  (AP_SIGNAL_AMPLITUDE, attenuation, amp_scale, actual_amp)
             
@@ -544,91 +544,128 @@ class AP:
         plt.tight_layout()
         output_dir = f'sim_figures/AP_{self.ap_id}'
         os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(os.path.join(output_dir, f"signal_charactertistics_at_position_{norm_pos[0]:.2f}_{norm_pos[1]:.2f}.png"), 
+        plt.savefig(os.path.join(output_dir, f"signal_charactertistics_at_location_{norm_pos[0]:.2f}_{norm_pos[1]:.2f}.png"), 
                   dpi=300, bbox_inches='tight')
         plt.close()
 
-    def test_beamforming_amplitude(self, theta=None):
+    def test_beamforming_optimal_phases(self):
         """
-        Generate the beamforming amplitude map with the given theta
+        Generate the beamforming maximum amplitude mapping to phase shifts
         """
-        # Determine the phase shift
-        phase_shift = -np.pi/2
-        if theta is not None:
-            phase_shift = theta
-
-        # Create the test grid (using the actual coordinates)
-        grid_size = 101 # consider boundary ceil
+        # Create the test grid
+        grid_size = 200
         x = np.linspace(0, FIELD_SIZE, grid_size)
         y = np.linspace(0, FIELD_SIZE, grid_size)
-        csv_filename = f"beamforming_phase_theta={round(phase_shift/np.pi, 2):.2f}pi.csv"
+        X, Y = np.meshgrid(x, y)
+        
+        # 初始化存储矩阵
+        max_amplitudes = np.zeros((grid_size, grid_size))
+        best_phases = np.zeros((grid_size, grid_size))
+        
+        # 预计算所有位置的波束成形相位差（调整为三维数组）
+        beam_phases = np.zeros((grid_size, grid_size, self.antenna_num))
+        for i in range(grid_size):
+            for j in range(grid_size):
+                norm_x = x[i] / FIELD_SIZE
+                norm_y = y[j] / FIELD_SIZE
+                pos = np.array([norm_x, norm_y])
+                beam_phases[i,j,:] = self.calculate_beamforming_phase(pos)  # 存储所有天线相位
+        
+        # 遍历所有可能的相位偏移
+        theta_values = np.linspace(-np.pi/2, np.pi/2, self.phase_shifts_per_sweep)
+        for theta in theta_values:
+            # 计算当前θ下的总信号幅度（向量化计算）
+            total_phases = theta + beam_phases
+            amplitudes = np.abs(np.sum(np.sin(total_phases), axis=2))  # 对所有天线求和
+            
+            # 更新最大值记录
+            mask = amplitudes > max_amplitudes
+            max_amplitudes[mask] = amplitudes[mask]
+            best_phases[mask] = theta
+        
+        # 保存数据到CSV
+        csv_filename = f"beamforming_optimal_phases.csv"
         csv_path = os.path.join(os.path.dirname(__file__), f"sim_stats/AP_{self.ap_id}", csv_filename)
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         
-        amplitude_map = np.zeros((grid_size, grid_size))
         with open(csv_path, 'w') as f:
+            # format: x_m,y_m,optimal_theta,max_amplitude
             for i in range(grid_size):
-                for j in range(grid_size): 
-                    norm_x = x[i] / FIELD_SIZE
-                    norm_y = y[j] / FIELD_SIZE
-                    pos = np.array([norm_x, norm_y])
-                    beam_phases = self.calculate_beamforming_phase(pos)
-                    amplitude_map[i,j] = sum([np.sin(phase_shift + phase) for phase in beam_phases]) / len(beam_phases)
-                    f.write(f"{x[i]:.1f},{y[j]:.1f},{amplitude_map[i,j]:.3f}\n")
-
-        # 绘制热力图
-        plt.figure(figsize=(10, 8))
-        plt.imshow(amplitude_map, 
-                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE],
-                  origin='lower',
-                  cmap='Blues', 
-                  aspect='equal')
+                for j in range(grid_size):
+                    f.write(f"{x[i]:.1f},{y[j]:.1f},{best_phases[i,j]:.3f},{max_amplitudes[i,j]:.3f}\n")
         
-        # 标注当前AP
-        ap_loc = self.location
+        # 绘制热力图
+        plt.figure(figsize=(12, 10))
+        
+        # 创建自定义颜色映射（包含alpha通道）
+        blues = plt.cm.Blues(np.linspace(0.1, 0.9, 256))  # 调整颜色范围
+        blues[:, 3] = np.linspace(0.1, 0.6, 256)  # 设置透明度渐变
+        cmap = ListedColormap(blues)
+
+        img = plt.imshow(best_phases, 
+                        extent=[0, FIELD_SIZE, 0, FIELD_SIZE],
+                        origin='lower',
+                        cmap=cmap,
+                        aspect='equal',
+                        vmin=-np.pi/2, 
+                        vmax=np.pi/2,
+                        interpolation='bilinear')
+        
+        # 配置颜色条
+        cbar = plt.colorbar(img, 
+                           label='Optimal Phase Shift θ (rad)',
+                           ticks=np.linspace(-np.pi/2, np.pi/2, 5),
+                           extend='both')
+        cbar.set_ticklabels(['-π/2', '-π/4', '0', 'π/4', 'π/2'])
+        cbar.outline.set_edgecolor('black')
+
+        # Add environment markers
+        self.test_plot_environment_markers()
+        
+        plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {self.phase_shifts_per_sweep})")
+        plt.xlabel("X (meters)")
+        plt.ylabel("Y (meters)")
+        
+        # 保存图片
+        save_path = os.path.join(os.path.dirname(__file__), 
+                               f"sim_figures/AP_{self.ap_id}/beamforming_optimal_phases.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')  # 白色背景提高对比度
+        plt.close()
+
+    def test_plot_environment_markers(self):
+        """
+        Unified environment markers plot
+        """
+        
+        # Current AP
+        ap_loc = to_meters(self.location_normalized)
         plt.scatter(ap_loc[0], ap_loc[1], 
-                   marker='^', s=200, c='red', 
+                   marker='^', s=200, c='red',
                    edgecolors='white', label=f'AP {self.ap_id}')
         
-        # 标注其他AP
-        for i, ap in enumerate(APs):
-            if i != self.ap_id:
-                other_loc = ap.location
-                plt.scatter(other_loc[0], other_loc[1], 
+        # Other APs
+        for ap in APs:
+            if ap.ap_id != self.ap_id:
+                other_loc = to_meters(ap.location_normalized)
+                plt.scatter(other_loc[0], other_loc[1],
                            marker='^', s=120, c='red',
                            alpha=0.5)
         
-        # 标注蜂巢
-        hive_pos_m = (HIVE_POS[0]*FIELD_SIZE, HIVE_POS[1]*FIELD_SIZE)
-        plt.scatter(hive_pos_m[0], hive_pos_m[1], 
-                   marker='s', s=120, c='green', 
+        # Hive
+        hive_pos = to_meters(HIVE_POS_NORM)
+        plt.scatter(hive_pos[0], hive_pos[1],
+                   marker='s', s=120, c='green',
                    alpha=0.5)
         
-        # 标注蜜源
+        # Food sources
         for fs in food_sources:
-            fs_pos = (fs.position[0]*FIELD_SIZE, 
-                     fs.position[1]*FIELD_SIZE)
-            plt.scatter(fs_pos[0], fs_pos[1], 
+            fs_pos = to_meters(fs.location_normalized)
+            plt.scatter(fs_pos[0], fs_pos[1],
                        marker='o', s=80, c='blue',
                        alpha=0.5)
         
-        # 添加图例和坐标轴
-        plt.legend(loc='upper right')
-        
-        # 添加colorbar
-        cbar = plt.colorbar(label='Total Phase (rad)')
-        cbar.set_ticks(np.linspace(-np.pi, np.pi, 7))
-        cbar.set_ticklabels(['-π', '-2π/3', '-π/3', '0', 'π/3', '2π/3', 'π'])
-
-        plt.title(f"Beamforming Amplitude Map @ AP{self.ap_id}\n"
-                 f"Antenna Phase Shift θ: {phase_shift/np.pi:.2f}π")
-        plt.xlabel("X (m)")
-        plt.ylabel("Y (m)")
-        
-        # 保存图片
-        save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_phase_theta={round(phase_shift/np.pi, 2):.2f}pi.png")
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
+        # Add legend
+        plt.legend(loc='upper right', framealpha=0.9)
 
 class Simulation:
     def __init__(self, food_sources):
@@ -653,7 +690,7 @@ class Simulation:
 
                 # Clear the target food if it is found to be empty
                 for fs in self.food_sources:
-                    distance = np.linalg.norm(fs.position - bee.position)
+                    distance = np.linalg.norm(fs.location_normalized - bee.location_normalized)
                     if distance < NECTAR_EMPTY_DISCOVERY_DISTANCE:
                         if fs.nectar <= 0:
                             bee.known_empty_sources.add(fs)
@@ -667,7 +704,7 @@ class Simulation:
                         if bee.target_food is None:
                             bee.target_food = fs
                         else:
-                            current_dist = np.linalg.norm(bee.target_food.position - bee.position)
+                            current_dist = np.linalg.norm(bee.target_food.location_normalized - bee.location_normalized)
                             if distance < current_dist:
                                 bee.target_food = fs
                 if (bee.target_food and bee.target_food in bee.known_empty_sources):
@@ -680,22 +717,22 @@ class Simulation:
                         if fs not in bee.known_empty_sources
                     ]
                     if potential_sources:
-                        distances = [np.linalg.norm(fs.position - bee.position) for fs in potential_sources]
+                        distances = [np.linalg.norm(fs.location_normalized - bee.location_normalized) for fs in potential_sources]
                         bee.target_food = potential_sources[np.argmin(distances)]
                     else:
                         bee.reset_knowledge()
                 
                 # Move to the target food
                 if bee.target_food:
-                    direction = bee.target_food.position - bee.position
+                    direction = bee.target_food.location_normalized - bee.location_normalized
                     distance = np.linalg.norm(direction)
                     if distance > 0:
                         step_size = np.clip(STEP_SIZE * distance, MIN_STEP, MAX_STEP)
                         step = (direction / distance) * step_size
-                        bee.position += step + np.random.normal(0, STEP_NOISE, 2)
+                        bee.location_normalized += step + np.random.normal(0, STEP_NOISE, 2)
 
                     # Arrived at the target food
-                    if np.linalg.norm(bee.position - bee.target_food.position) < OVERLAP_DISTANCE_ERROR:
+                    if np.linalg.norm(bee.location_normalized - bee.target_food.location_normalized) < OVERLAP_DISTANCE_ERROR:
                         if bee.target_food.nectar > 0:
                             bee.target_food.nectar -= 1
                             bee.has_food = True
@@ -704,15 +741,15 @@ class Simulation:
                         bee.target_food = None
             else:
                 # Move back to Hive
-                direction = np.array(HIVE_POS) - bee.position
+                direction = np.array(HIVE_POS_NORM) - bee.location_normalized
                 distance = np.linalg.norm(direction)
                 if distance > 0:
                     step_size = np.clip(STEP_SIZE * distance, MIN_STEP, MAX_STEP)
                     step = (direction / distance) * step_size
-                    bee.position += step + np.random.normal(0, STEP_NOISE, 2)
+                    bee.location_normalized += step + np.random.normal(0, STEP_NOISE, 2)
                 
                     # Arrived at Hive
-                    if np.linalg.norm(bee.position - HIVE_POS) < OVERLAP_DISTANCE_ERROR:
+                    if np.linalg.norm(bee.location_normalized - HIVE_POS_NORM) < OVERLAP_DISTANCE_ERROR:
                         bee.has_food = False
 
         for _, fs in enumerate(self.food_sources):
@@ -720,9 +757,15 @@ class Simulation:
                 fs.nectar = -1
                 fs.recovery_timer = 1000 / FRAME_TIME * NECTAR_EXPECTED_RECOVERY_TIME * (0.8 + 0.4 * random.random())
 
+
+
+# Convert normalized coordinates to actual meters
+def to_meters(norm_pos):
+    return [norm_pos[0] * FIELD_SIZE, norm_pos[1] * FIELD_SIZE / FIELD_ASPECT_RATIO]
+        
 # Generate APs [STATIC]
 APs = []
-for i, pos in enumerate(AP_POS):
+for i, pos in enumerate(AP_POS_NORM):
     new_AP = AP(i, 
                   (pos[0] * FIELD_SIZE, pos[1] * FIELD_SIZE / FIELD_ASPECT_RATIO),
                   AP_NUM_ANTENNAS, 
@@ -734,24 +777,22 @@ for i, pos in enumerate(AP_POS):
     # All APs are coarsely synchronized using TDMA, 
     # given the same frequency, all APs uniformly distribute the AP_SWEEP_T
     # so that the signal generation is coherent
-    new_AP.set_signal_start((-1 + i / len(AP_POS)) * AP_SWEEP_T)
+    new_AP.set_signal_start((-1 + i / len(AP_POS_NORM)) * AP_SWEEP_T)
     APs.append(new_AP)
 
-
-
 # Generate food sources [STATIC]
-def generate_valid_position(existing_positions, min_dist=0.05):
+def generate_valid_location(existing_locations, min_dist=0.05):
     while True:
         pos = np.random.rand(2)
         pos[0] = 0.05 + 0.9 * pos[0]
         pos[1] = 0.05 + 0.9 * pos[1]
-        if all(np.linalg.norm(pos - p) >= min_dist for p in existing_positions):
+        if all(np.linalg.norm(pos - p) >= min_dist for p in existing_locations):
             return pos
-all_positions = [HIVE_POS] + AP_POS
+all_locations = [HIVE_POS_NORM] + AP_POS_NORM
 food_sources = []
 for _ in range(NUM_FOOD_SOURCES):
-    pos = generate_valid_position(all_positions)
-    all_positions.append(pos)
+    pos = generate_valid_location(all_locations)
+    all_locations.append(pos)
     food_sources.append(Food(pos))
 
 # Output the environment topology
@@ -762,15 +803,15 @@ for i, ap in enumerate(APs):
     print (f"│   {'├─' if i < len(APs)-1 else '└─'} AP {i}: [{ap.location[0]:.3f}, {ap.location[1]:.3f}] m")
 
 hive_pos_m = (
-    HIVE_POS[0] * FIELD_SIZE,
-    HIVE_POS[1] * FIELD_SIZE / FIELD_ASPECT_RATIO
+    HIVE_POS_NORM[0] * FIELD_SIZE,
+    HIVE_POS_NORM[1] * FIELD_SIZE / FIELD_ASPECT_RATIO
 )
 print (f"├─ Hive Position: [{hive_pos_m[0]:.3f}, {hive_pos_m[1]:.3f}] m")
 print (f"└─ Food Sources (Total {len(food_sources)}):")
 for i, fs in enumerate(food_sources):
     fs_pos_m = (
-        fs.position[0] * FIELD_SIZE,
-        fs.position[1] * FIELD_SIZE / FIELD_ASPECT_RATIO
+        fs.location_normalized[0] * FIELD_SIZE,
+        fs.location_normalized[1] * FIELD_SIZE / FIELD_ASPECT_RATIO
     )
     connector = '├─' if i < len(food_sources)-1 else '└─'
     print (f"    {connector} Source {i}: [{fs_pos_m[0]:.3f}, {fs_pos_m[1]:.3f}] m")
@@ -809,33 +850,10 @@ def plot_attenuation_map(ap_id, attenuation_grid):
     cbar.set_ticks(np.linspace(0, vmax, 10))
     cbar.outline.set_edgecolor('black')
     plt.setp(cbar.ax.yaxis.get_ticklines(), color='black')
-    
-    # 标注当前AP
-    ap_loc = APs[ap_id].location
-    plt.scatter(ap_loc[0], ap_loc[1], 
-               marker='^', s=200, c='red', 
-               edgecolors='white', label=f'AP {ap_id}')
-    
-    # 标注其他AP
-    for i, ap in enumerate(APs):
-        if i != ap_id:
-            plt.scatter(ap.location[0], ap.location[1], 
-                       marker='^', s=120, c='red',
-                       alpha=0.5)
-    
-    # 标注蜂巢
-    plt.scatter(hive_pos_m[0], hive_pos_m[1], 
-               marker='s', s=120, c='green', 
-               alpha=0.5)
-    
-    # 标注蜜源
-    for fs in food_sources:
-        fs_pos = (fs.position[0]*FIELD_SIZE, 
-                 fs.position[1]*FIELD_SIZE/FIELD_ASPECT_RATIO)
-        plt.scatter(fs_pos[0], fs_pos[1], 
-                   marker='o', s=80, c='blue',
-                   alpha=0.5)
-    
+
+    # Create environment markers
+    APs[ap_id].test_plot_environment_markers()
+
     plt.title(f"AP {ap_id} Signal Attenuation Map")
     plt.xlabel("X (meters)")
     plt.ylabel("Y (meters)")
@@ -853,13 +871,13 @@ def find_nlos():
     '''
     os.makedirs('sim_stats', exist_ok=True)
     
-    # Get all obstacle positions (converted to meters)
+    # Get all obstacle locations (converted to meters)
     obstacles = []
     obstacles.append(('hive', hive_pos_m, PENETRATION_LOSS_HIVE))
     for ap in APs:
         obstacles.append(('ap', ap.location, PENETRATION_LOSS_AP))
     for fs in food_sources:
-        fs_pos_m = (fs.position[0]*FIELD_SIZE, fs.position[1]*FIELD_SIZE/FIELD_ASPECT_RATIO)
+        fs_pos_m = (fs.location_normalized[0]*FIELD_SIZE, fs.location_normalized[1]*FIELD_SIZE/FIELD_ASPECT_RATIO)
         obstacles.append(('food', fs_pos_m, PENETRATION_LOSS_FOOD))
 
     # Generate attenuation map for each AP
@@ -940,8 +958,8 @@ for ap in APs:
 # Run the tests
 for ap in APs:
     ap.test_signal_characteristics(ap.signal_start)
-    ap.test_signal_charactertistics_at_position((0.0, 0.0))
-    ap.test_beamforming_amplitude()
+    ap.test_signal_charactertistics_at_location((0.0, 0.0))
+    ap.test_beamforming_optimal_phases()
 
 exit(1)  # stop here
 
@@ -963,18 +981,18 @@ bee_scatter = ax.scatter(
     label='Bees'
 )
 ax.plot([], [], 'ro', markersize=12, alpha=0.8)
-ax.plot(HIVE_POS[0], HIVE_POS[1], 'gs', markersize=15, label='Hive')
+ax.plot(HIVE_POS_NORM[0], HIVE_POS_NORM[1], 'gs', markersize=15, label='Hive')
 food_scatter = ax.scatter(
-    [fs.position[0] for fs in food_sources],
-    [fs.position[1] for fs in food_sources],
+    [fs.location_normalized[0] for fs in food_sources],
+    [fs.location_normalized[1] for fs in food_sources],
     c='#1E90FF', 
     s=[fs.nectar / NECTAR_EXPECTED_STORAGE * NECTAR_DISPLAY_SIZE * 2 for fs in food_sources],
     edgecolors='white'
 )
-for i, ap in enumerate(AP_POS):
+for i, ap in enumerate(AP_POS_NORM):
     label = 'AP' if i == 0 else None
     ax.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8, label=label)
-food_labels = [ax.text(fs.position[0], fs.position[1]+0.02, str(fs.nectar), 
+food_labels = [ax.text(fs.location_normalized[0], fs.location_normalized[1]+0.02, str(fs.nectar), 
                       ha='center', va='bottom', color='white', fontsize=8)
               for fs in food_sources]
 legend_elements = [
@@ -1063,23 +1081,23 @@ def update(frame):
             ax_bee.set_facecolor('black')
             
             # Draw the access points
-            for ap in AP_POS:
+            for ap in AP_POS_NORM:
                 ax_bee.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8)
             
             # Draw the trajectory of this bee
-            trail_positions = []
+            trail_locations = []
             trail_alphas = []
             for pos, timestamp in bee.history:
                 age = current_time - timestamp
                 alpha = max(0, 1 - age/MOVEMENT_DISAPPEAR_TIME)
                 if alpha > 0:
-                    trail_positions.append(pos)
+                    trail_locations.append(pos)
                     trail_alphas.append(alpha)
             
-            if trail_positions:
+            if trail_locations:
                 ax_bee.scatter(
-                    [p[0] for p in trail_positions],
-                    [p[1] for p in trail_positions],
+                    [p[0] for p in trail_locations],
+                    [p[1] for p in trail_locations],
                     c="yellow", 
                     s=20,
                     alpha=trail_alphas,
@@ -1089,7 +1107,7 @@ def update(frame):
             plt.savefig(f'{bee_dir}/trail_{prev_save_time}ms-{current_time}ms.png', dpi=150, bbox_inches='tight')
             plt.close(fig_bee)
     for bee in sim.bees:
-        bee.update_position_history(current_frame_id * FRAME_TIME)
+        bee.update_location_history(current_frame_id * FRAME_TIME)
     if (frame + 1) % (NUM_FRAMES // trail_save_num) == 0:
         save_bee_trails(frame+1, current_time)
         global prev_save_time
@@ -1098,9 +1116,9 @@ def update(frame):
     # Update the bees and nectars (and their displays)
     sim.update_bees()
     sim.update_nectar()
-    positions = np.array([b.position for b in sim.bees])
+    locations = np.array([b.location_normalized for b in sim.bees])
     alphas = [0.7 if b.has_food else 0.2 for b in sim.bees]
-    bee_scatter.set_offsets(positions)
+    bee_scatter.set_offsets(locations)
     bee_scatter.set_alpha(alphas)
     food_sizes = []
     food_alphas = []
