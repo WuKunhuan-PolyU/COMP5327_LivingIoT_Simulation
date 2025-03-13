@@ -3,11 +3,10 @@ Paper: Living IoT:AFlyingWireless Platformon LiveInsects
 Bee flight simulation with a focus on the localization with multiple APs
 '''
 import numpy as np
-import os, datetime, math, shutil, random
+import os, datetime, math, shutil, random, time, threading
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 import matplotlib.gridspec as gridspec
-import threading, time
 from matplotlib.colors import ListedColormap
 
 if os.path.exists('sim.gif'):
@@ -21,6 +20,7 @@ NUM_BEES = 2
 NUM_FOOD_SOURCES = 5  # randomly distributed in the field
 HIVE_POS_NORM = (0.5, 0.1)                  # normalized
 AP_POS_NORM = [(0.25, 0.5), (0.75, 0.5)]    # normalized
+AP_NUM = len(AP_POS_NORM)
 FIG_SIZE = (8, 8)
 NECTAR_DISPLAY_SIZE = 50
 NECTAR_EXPECTED_STORAGE = 15
@@ -30,8 +30,9 @@ NECTAR_EXPECTED_RECOVERY_TIME = 20
 AP_PREAMBLES = [(1,0,1,0,1,0,1,0), (1,1,0,0,1,1,0,0)]
 # numbers are chosen for the ease of simulation
 AP_SWEEP_T = 50
-AP_SWEEP_PREAMBLE_T = 5   # time (ms) of preamble in a sweep <- self chosen
+AP_PREAMBLE_T = 5   # time (ms) of preamble in a sweep <- self chosen
 AP_PHASESHIFT_NUM = 50
+assert (NUM_BEES * AP_NUM * AP_PHASESHIFT_NUM <= 10000)
 # in (50, 5, 90) setting, each phase shift takes 0.5ms
 # as TDMA is used, the signals are transmitted in a time-division manner
 # for example, if there are 2 APs, and the sweep time is 50ms
@@ -41,11 +42,11 @@ AP_NUM_ANTENNAS = 2
 AP_FREQ = 915e6         # 915 MHz
 AP_SIGNAL_STRENGTH = 28 # dBm
 AP_SIGNAL_AMPLITUDE = 10**(AP_SIGNAL_STRENGTH / 20)  # 转换dBm为线性振幅
-AP_SAMPLE_RATE = 4 * AP_FREQ  # 4倍过采样（足够捕获信号特征）
+AP_SAMPLE_RATE = 4 * AP_FREQ  # 4倍过采样（实际未使用）
 
 # Simulation Parameters
 FRAME_TIME = 50    # ms
-SIM_TIME = 100   # msAP_NUM_ANTENNAS
+SIM_TIME = 500     # ms
 NUM_FRAMES = round(SIM_TIME / FRAME_TIME)
 
 # Bee Parameters
@@ -75,15 +76,23 @@ class Food:
         self.recovery_timer = 0
 
 class Bee:
-    def __init__(self, food_sources):
+    def __init__(self, bee_id, food_sources):
+        self.bee_id = bee_id
         self.location_normalized = np.array(HIVE_POS_NORM)
         self.target_food = None
         self.food_sources = food_sources
         self.has_food = False
         self.known_empty_sources = set() # Local memory of empty food sources
         self.history = []  # Record location and time
-        self.signal_memory = {}  # 结构: {ap_id: [(timestamp, sample), ...]}
-        self.plotted_aps = set()  # 记录已绘制过的AP
+        self.signal_memory = [] # Record the signal memory. Format: [(timestamp, amplitude), ...]
+        self.signal_memory_preambles = [] # Record preamble signal's first timestamp. Format: [(timestamp, ap_id), ...]
+        self.signal_memory_ap_angles = []  # Record the AP angle from max amplitude timestamps after each preamble. Format: [(timestamp, ap_id, angle), ...]
+        self.signal_received_count = 0
+
+        # testing purposes
+        self.signal_memory_debug_count = 0
+        self.signal_receive_plotted = False
+
 
     def reset_knowledge(self):
         self.known_empty_sources.clear()
@@ -92,77 +101,207 @@ class Bee:
         self.history.append((self.location_normalized.copy(), frame_time))
         if len(self.history) > math.ceil(MOVEMENT_DISAPPEAR_TIME / FRAME_TIME):
             self.history.pop(0)
+    
+    def detect_preamble_signal(self, samples):
+        '''
+        改进前导码检测逻辑
+        '''
+        preamble_length = len(AP_PREAMBLES[0])
+        # 计算预期前导码持续时间对应的样本数
+        expected_preamble_samples = int(AP_PREAMBLE_T * AP_SAMPLE_RATE / 1000)
+        if len(samples) < expected_preamble_samples:
+            return None
+        
+        # 滑动窗口检测
+        best_match = {'ap_id': -1, 'count': 0, 'start': 0}
+        for offset in range(len(samples) - expected_preamble_samples + 1):
+            window = samples[offset:offset+expected_preamble_samples]
+            max_amp = max(s[1] for s in window)
+            threshold = 0.5 * max_amp  # 50%幅度作为阈值
+            symbols = [int(s[1] > threshold) for s in window]
+            
+            # 匹配所有AP的前导码
+            for ap_id, preamble in enumerate(AP_PREAMBLES):
+                matched = 0
+                step = expected_preamble_samples // preamble_length  # 精确步长
+                for i in range(preamble_length):
+                    pos = i * step
+                    if pos < len(symbols) and abs(symbols[pos] - preamble[i]) < 0.5:  # 允许幅度误差
+                        matched += 1
+                
+                if matched > best_match['count']:
+                    best_match.update({
+                        'ap_id': ap_id,
+                        'count': matched,
+                        'start': samples[offset][0]
+                    })
+        
+        if best_match['count'] >= preamble_length * 0.9:  # 提高匹配阈值
+            return (best_match['start'], best_match['ap_id'])
+        return None
 
-    def receive_signal(self, ap_id, timestamps, samples):
-        '''存储接收到的信号数据，保留最近3个sweep周期的数据'''
-        # 获取当前AP的sweep周期
-        ap = next((a for a in APs if a.ap_id == ap_id), None)
-        if not ap: return
+    def find_angle_from_max_amplitude(self, signal_segment, ap_id):
+        # 找到最大幅度对应的相位索引
+        max_idx = np.argmax([s[1] for s in signal_segment])
+        max_time = signal_segment[max_idx][0]
+        
+        # 通过预存参数计算相位
+        sweep_interval = AP_SWEEP_T * AP_NUM  # 总扫描周期
+        sweep_start = (max_time // sweep_interval) * sweep_interval
+        phase_index = int(
+            (max_time - sweep_start - AP_PREAMBLE_T) / 
+            (AP_SWEEP_T - AP_PREAMBLE_T) * AP_PHASESHIFT_NUM
+        ) % AP_PHASESHIFT_NUM
+        
+        # 根据相位索引计算角度
+        theta = -np.pi/2 + (2*np.pi / AP_PHASESHIFT_NUM) * phase_index
+        wavelength = 3e8 / AP_FREQ
+        phase_diff = theta * wavelength / (2 * np.pi)
+        angle = np.arcsin(phase_diff / (0.5 * wavelength))  # 假设天线间距为半波长
+        return np.degrees(angle)
 
-        # 合并新数据
-        new_data = list(zip(timestamps, samples))
-        if ap_id not in self.signal_memory:
-            self.signal_memory[ap_id] = []
+    def plot_received_signal(self, bee_id, signal_memory, mark = False):
+        '''
+        Plot the received signal from all APs
+        '''
+        if not signal_memory: return
         
-        # 合并并排序
-        self.signal_memory[ap_id].extend(new_data)
-        # 仅在需要时排序（比如绘图前）
-
-        # 首次达到3T时绘制信号
-        if ap_id not in self.plotted_aps:
-            if len(self.signal_memory.get(ap_id, [])) >= 3 * APs[ap_id].sweep_time / (1000/AP_SAMPLE_RATE):
-                self.plot_ap_signals(ap_id)
-                self.plotted_aps.add(ap_id)
-
-        # 输出接收日志
-        if timestamps:
-            print (f"\nBee {id(self)} 接收AP{ap_id}信号")
-            print (f"├─ 首时间戳: {timestamps[0]:.2f}ms")
-            print (f"├─ 末时间戳: {timestamps[-1]:.2f}ms")
-            duration = timestamps[-1] - timestamps[0]
-            print (f"├─ 持续时间: {duration:.2f}ms")
-            print (f"└─ 对应周期数: {duration / ap.sweep_time:.1f}T")
-
-        # 添加严格的内存限制
-        max_samples = 3 * ap.sweep_time * AP_SAMPLE_RATE / 1000  # 精确计算3T样本数
-        if len(self.signal_memory[ap_id]) > max_samples * 1.2:  # 允许20%冗余
-            self.signal_memory[ap_id] = self.signal_memory[ap_id][-int(max_samples):]
-
-    def plot_ap_signals(self, ap_id):
-        '''绘制指定AP的完整信号波形'''
-        if ap_id not in self.signal_memory:
-            return
+        plt.figure(figsize=(12, 6))
+        times = [s[0] for s in signal_memory]
+        amps = [s[1] for s in signal_memory]
         
-        data = self.signal_memory[ap_id]
+        # Plot the raw signal
+        plt.plot(times, amps, 'b-', alpha=0.3, label='Raw Signal')
+        if (mark): 
+            # Mark the preamble region
+            for ts, ap_id in self.signal_memory_preambles:
+                start = ts
+                end = start + AP_PREAMBLE_T
+                plt.axvspan(start, end, alpha=0.2, color=['red','blue'][ap_id], label=f'AP{ap_id} Preamble')
+            
+            # Mark the angle calculation result
+            for ts, ap_id, angle in self.signal_memory_ap_angles:
+                plt.axvline(x=ts, color=['darkred','darkblue'][ap_id], linestyle='--', 
+                        label=f'AP{ap_id} Angle: {angle:.1f}°')
         
-        # Use the first timestamp and the last timestamp to decide whether
-        # the signal duration has achieved 3T
-        if not data or (data[-1][0] - data[0][0]) < 3 * APs[ap_id].sweep_time:
-            return
+        plt.xlabel('Time (ms)')
+        plt.ylabel('Amplitude')
+        plt.title(f'Bee {bee_id} Received Signal')
+        plt.legend()
         
-        timestamps, samples = zip(*data)
-        
-        plt.figure(figsize=(12, 4))
-        plt.plot(timestamps, samples, linewidth=0.5, alpha=0.7)
-        plt.title(f"Bee {id(self)} Received Signals from AP{ap_id}\n"
-                 f"Duration: {max(timestamps)-min(timestamps):.1f}ms")
-        plt.xlabel("Time (ms)")
-        plt.ylabel("Amplitude (V)")
-        
-        # 标注关键区域
-        ap = next(a for a in APs if a.ap_id == ap_id)
-        for t in np.arange(min(timestamps), max(timestamps), ap.sweep_time):
-            plt.axvspan(t, t+ap.preamble_duration, color='gray', alpha=0.2)
-        
-        output_dir = f'sim_figures/bee_{id(self)}'
-        os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(os.path.join(output_dir, f"AP_{ap_id}_3Tsignal.png"), 
-                  dpi=200, bbox_inches='tight')
+        # Save the figure
+        os.makedirs(f'sim_figures/bee_{bee_id:02d}', exist_ok=True)
+        plt.savefig(f'sim_figures/bee_{bee_id:02d}/received_signal{"_raw_" + str(self.signal_memory_debug_count) if not mark else ""}.png', 
+                      dpi=200, bbox_inches='tight')
         plt.close()
 
-        print (f"Bee {id(self)} 已为AP{ap_id}生成信号图")
-        print (f"├─ 样本数: {len(data)}")
-        print (f"└─ 时间范围: {max(t)-min(t):.1f}ms")
+    def receive_signal(self, timestamps, samples):
+        '''
+        Store the received signal data, keep the last 3 sweep periods
+        '''
+        new_data = list(zip(timestamps, samples))
+        
+        # format: timestamp,amplitude
+        if (len(new_data) > 0): 
+            if (self.signal_memory_debug_count < 3): 
+                self.data_dir = f"sim_stats/bee_{self.bee_id:02d}"
+                os.makedirs(self.data_dir, exist_ok=True)
+                with open(f"{self.data_dir}/received_signal_raw_{self.signal_memory_debug_count}.csv", "w") as f:
+                    for t, s in zip(timestamps, samples):
+                        f.write(f"{t:.5f},{s:.5f}\n")
+                self.plot_received_signal(self.bee_id, new_data)
+
+        # Merge and check whether sorted
+        # i.e., if the signal memory is not empty, 
+        # verify whether the new data is sorted, otherwise discard the observation
+        if (len(self.signal_memory) > 0):
+            if (new_data[0][0] < self.signal_memory[-1][0]):
+                print (f"Bee {id(self)} received signal ({new_data[0][0]:.2f}ms - {new_data[-1][0]:.2f}ms): Unsorted timestamps (latest received: {self.signal_memory[-1][0]:.2f}ms)")
+                return
+        self.signal_memory.extend(new_data)
+        before_crop_len = len(self.signal_memory)
+
+        # Process the signal memory, only preserve the last (num_APs + 1) * T samples
+        # e.g., if there are 2 APs, the last 3T samples are preserved
+        # crop the memory using the timestamp instead of the index
+        preserve_duration = (AP_NUM + 1) * AP_SWEEP_T * AP_SAMPLE_RATE / 1000
+        first_preserved_timestamp = self.signal_memory[-1][0] - preserve_duration
+        max_samples_per_sweep = AP_SAMPLE_RATE * AP_SWEEP_T / 1000
+        min_timestamp_index = len(self.signal_memory) - 1 - (AP_NUM + 1) * max_samples_per_sweep
+        if (min_timestamp_index < 0): 
+            min_timestamp_index = 0
+        actual_timestamp_at_crop = self.signal_memory[min_timestamp_index][0]
+        if (actual_timestamp_at_crop < first_preserved_timestamp):
+            left, right = min_timestamp_index, len(self.signal_memory) - 1
+            while left < right:
+                mid = (left + right) // 2
+                if (self.signal_memory[mid][0] < first_preserved_timestamp):
+                    left = mid + 1
+                else:
+                    right = mid
+            self.signal_memory = self.signal_memory[left:]
+        else: 
+            self.signal_memory = self.signal_memory[min_timestamp_index:]
+        after_crop_len = len(self.signal_memory)
+        actual_timestamp_at_crop = self.signal_memory[0][0] if self.signal_memory else None
+
+        # As one sweep can only have at most one AP transmitting, 
+        # the length of detected max amplitudes is at most AP_NUM
+        self.signal_memory_ap_angles = self.signal_memory_ap_angles[-AP_NUM:]
+        while (self.signal_memory_ap_angles and actual_timestamp_at_crop and 
+               self.signal_memory_ap_angles[0][0] < actual_timestamp_at_crop):
+            self.signal_memory_ap_angles.pop(0)
+
+        # "locate preamble2 in S_(i+T) .. S_(3T) at i" indicates that preamble pairs should 
+        # have at least T time gap between them
+        # According to the paper, detection can start from the last preamble end even recorded
+        # the new data must be preserved (not cropped due to exceeding the time limit)
+        assert (len(self.signal_memory) >= len(new_data))
+        preamble_search_index = len(self.signal_memory) - len(new_data)
+        preamble_detection = None
+        while (self.signal_memory_preambles and preamble_search_index < len(self.signal_memory) and
+               self.signal_memory[preamble_search_index][0] < self.signal_memory_preambles[-1][0] + AP_SWEEP_T): 
+            preamble_search_index += 1
+        if (preamble_search_index < len(self.signal_memory)):
+            result = self.detect_preamble_signal(self.signal_memory[preamble_search_index:])
+            if (result):
+                preamble_detection = result[1]
+                self.signal_memory_preambles.append(result)
+
+        # Process the signal segment after preamble
+        for ts, ap_id in self.signal_memory_preambles:
+            # Find the signal segment after preamble
+            start_idx = next(i for i, s in enumerate(self.signal_memory) if s[0] >= ts + AP_PREAMBLE_T)
+            end_time = ts + AP_SWEEP_T
+            signal_segment = [s for s in self.signal_memory[start_idx:] if s[0] <= end_time]
+            
+            # Calculate the angle
+            angle = self.find_angle_from_max_amplitude(signal_segment, ap_id)
+            if angle and not self.signal_receive_plotted:
+                self.signal_memory_ap_angles.append( (ts + AP_PREAMBLE_T, ap_id, angle) )
+                self.signal_receive_plotted = True
+
+        # Export the signal memory to a csv file
+        if (self.signal_memory_debug_count < 3 and len(timestamps) > 0):
+            print (f"\nBee {self.bee_id} received signal")
+            print (f"├─ First timestamp: {timestamps[0]:.2f}ms")
+            print (f"├─ Last timestamp: {timestamps[-1]:.2f}ms")
+            duration = timestamps[-1] - timestamps[0]
+            print (f"├─ Duration: {duration:.2f}ms")
+            print (f"├─ Num of new samples: {len(new_data)}")
+            print (f"├─ Num of deleted samples: {before_crop_len - after_crop_len}")
+            print (f"├─ Num of stored samples: {len(self.signal_memory)}")
+            if (preamble_detection): 
+                print (f"├─ AP detected from preamble: {preamble_detection}")
+            print (f"└─ AP angles: {self.signal_memory_ap_angles}")
+
+        # Plot when keeping received signal and the memory overflows
+        if first_preserved_timestamp > 0 and not self.signal_receive_plotted:
+            self.plot_received_signal(self.bee_id, self.signal_memory, mark = True)
+            self.signal_receive_plotted = True
+        
+        self.signal_memory_debug_count += 1
+        
 
     def sample_location_history(self):
         pass
@@ -177,9 +316,6 @@ class AP:
                  frequency, # in Hz
                  preamble_signal, 
                  antenna_layout_direction = 0, # radians, counterclockwise from the positive x-axis
-                 sweep_time = 50, # in ms
-                 preamble_duration = 5, # in ms
-                 phase_shifts_per_sweep = 90,  # 根据论文Algorithm 1命名
                  ):
         self.ap_id = ap_id
         self.location = np.array(location) # not normalized, in meters
@@ -200,16 +336,11 @@ class AP:
             self.location + self.antenna_spacing * (i - (self.antenna_num-1)/2) * antenna_layout_direction_vector
             for i in range(self.antenna_num)
         ]
-        
-        self.sweep_time = sweep_time
-        self.preamble_duration = preamble_duration
 
-        # 波束成形相关参数
-        self.phase_shifts_per_sweep = phase_shifts_per_sweep 
-        self.phase_step = np.pi / self.phase_shifts_per_sweep  # δ = π/90 ≈ 2°
+        # 波束成形相关参数  
+        self.phase_step = np.pi / AP_PHASESHIFT_NUM  # δ = π/90 ≈ 2°
         self.antenna_phases = [0.0] * (self.antenna_num + 1)  # 天线编号从1开始
 
-        # self.transmit_lock = threading.Lock()
         self.test_transmit_time = 0 # testing purpose
         self.test_transmit_count = 0 # testing purpose
 
@@ -276,8 +407,11 @@ class AP:
                     Global  Beamforming phase
                     shift   difference
         '''
-        if (self.signal_start is None or timestamp < self.signal_start):
-            return 0 # signal generation not started yet
+        # signal generation not started yet, OR
+        # the current time is not designed for this AP to transmit
+        if (self.signal_start is None or timestamp < self.signal_start or 
+            (timestamp - self.signal_start) % (AP_NUM * AP_SWEEP_T) >= AP_SWEEP_T): 
+            return 0
         
         # Global phase offset (due to TDMA scheduling)
         # Calculate the beamformed phase shift <- all the antennas
@@ -285,63 +419,69 @@ class AP:
         beam_phases = [0 for _ in range(self.antenna_num)]
         if location is not None:
             beam_phases = self.calculate_beamforming_phase(location)
-        equivalent_signal_start = self.signal_start + self.sweep_time * ((timestamp - self.signal_start) // self.sweep_time)
-        if (timestamp < equivalent_signal_start + self.preamble_duration): 
+        equivalent_signal_start = self.signal_start + AP_SWEEP_T * ((timestamp - self.signal_start) // AP_SWEEP_T)
+        if (timestamp < equivalent_signal_start + AP_PREAMBLE_T): 
             # Preamble phase
-            return self.preamble[int((timestamp - equivalent_signal_start) / self.preamble_duration * len(self.preamble))]
+            return self.preamble[int((timestamp - equivalent_signal_start) / AP_PREAMBLE_T * len(self.preamble))]
         else: 
             # Scan phase (Sweep phase)
             # normalize the signal amplitude from all antennas
             # time * 1e-3 convert unit into seconds in calculation
             # phase_shift_by_AP is the θ component in y(t) = |ax(t) + ae^(j(ϕ−θ)) * x(t)|
-            sweep_timestamp = timestamp - equivalent_signal_start - self.preamble_duration
-            phase_shift_by_AP = -np.pi/2 + (np.pi / self.phase_shifts_per_sweep) * int(self.phase_shifts_per_sweep * (sweep_timestamp - self.preamble_duration) / (self.sweep_time - self.preamble_duration))
+            sweep_timestamp = timestamp - equivalent_signal_start - AP_PREAMBLE_T
+            phase_shift_by_AP = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (sweep_timestamp - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
             return sum([np.sin(2 * np.pi * self.freq * (sweep_timestamp * 1e-3) + phase_shift_by_AP + phase) for phase in beam_phases]) / len(beam_phases)
 
-    def transmit_signal(self, bees, transmit_start_time):
-        start_time = time.perf_counter() # test performance
+    def transmit_signal(self, bees, timestamp):
+        '''
+        每个sweep周期生成AP_PHASESHIFT_NUM个样本
+        '''
+        # 检查是否在传输窗口
+        if (self.signal_start is None or 
+            timestamp < self.signal_start or 
+            (timestamp - self.signal_start) % (AP_NUM * AP_SWEEP_T) >= AP_SWEEP_T):
+            return 0
         
-        print (f"\nAP{self.ap_id} 开始传输 @ {transmit_start_time}ms")
-        print (f"├─ 目标蜜蜂数: {len(bees)}")
-        print (f"├─ 信号时长: {self.sweep_time}ms")
-        print (f"└─ 采样率: {AP_SAMPLE_RATE/1e6:.2f}MHz")
-
-        if not bees:
-            print ("  → 无目标蜜蜂")
-            return
-        self.signal_start = transmit_start_time
-
-        # 生成完整信号时间轴
-        timestamps = np.arange(
-            transmit_start_time,
-            transmit_start_time + self.sweep_time,
-            1000 / AP_SAMPLE_RATE
-        )
+        # 生成该sweep周期的时间轴
+        sweep_start = self.signal_start + ((timestamp - self.signal_start) // AP_SWEEP_T) * AP_SWEEP_T
+        timestamps, raw_samples = self.generate_signal(sweep_start)
         
-        # 为每个蜜蜂生成定制化信号
+        # 发送给所有蜜蜂
         for bee in bees:
-            if not hasattr(bee, 'location'):
-                print (f"  → 无效蜜蜂对象: {id(bee)}")
-                continue
-            
-            # 计算该蜜蜂的衰减系数
             attenuation = self.calculate_attenuation(bee.location_normalized)
             amp_scale = 10**(-attenuation/20)
-            
-            # 生成针对该蜜蜂的信号
-            samples = [
-                self.sample_signal(t, bee.location_normalized) * amp_scale
-                for t in timestamps
-            ]
-            
-            print (f"  → 发送给 Bee{id(bee)}")
-            print (f"    ├─ 样本数: {len(samples)}")
-            print (f"    └─ 时间范围: {timestamps[0]:.2f} - {timestamps[-1]:.2f}ms")
-            
-            bee.receive_signal(self.ap_id, timestamps, samples)
+            samples = [s * amp_scale for s in raw_samples]  # 现在s是单个数值
+            bee.receive_signal(timestamps, samples)
+        
+        return 1
 
-        duration = (time.perf_counter() - start_time) * 1000
-        print (f"  AP{self.ap_id} 传输耗时: {duration:.2f}ms")
+    def generate_signal(self, sweep_start):
+        '''
+        修复为返回（时间轴，样本列表）
+        '''
+        # 分阶段生成时间轴
+        preamble_samples = 5 * len(AP_PREAMBLES[0])
+        scan_samples = AP_PHASESHIFT_NUM
+        
+        # 生成时间轴
+        preamble_ts = np.linspace(sweep_start, sweep_start+AP_PREAMBLE_T, preamble_samples)
+        scan_ts = np.linspace(sweep_start+AP_PREAMBLE_T, sweep_start+AP_SWEEP_T, scan_samples)
+        timestamps = np.concatenate([preamble_ts, scan_ts]).tolist()
+        
+        # 生成每个时间点的信号
+        samples = []
+        for t in timestamps:
+            if t < sweep_start + AP_PREAMBLE_T:
+                # 前导码方波生成
+                symbol_idx = int((t - sweep_start) / AP_PREAMBLE_T * len(AP_PREAMBLES[self.ap_id]))
+                samples.append(AP_SIGNAL_AMPLITUDE * AP_PREAMBLES[self.ap_id][symbol_idx % len(AP_PREAMBLES[self.ap_id])])
+            else:
+                # 相位扫描信号生成
+                phase_index = int((t - sweep_start - AP_PREAMBLE_T)/(AP_SWEEP_T - AP_PREAMBLE_T)*AP_PHASESHIFT_NUM)
+                phase_shift = -np.pi/2 + (2*np.pi/AP_PHASESHIFT_NUM)*phase_index
+                samples.append(np.sin(phase_shift))  # 简化波束成形计算
+        
+        return timestamps, samples
 
     def get_signal_start(self):
         return self.signal_start
@@ -359,7 +499,7 @@ class AP:
 
         # Find the signal period
         period_ns = 1e9 / self.freq  # in ns
-        preamble_duration_ms = self.preamble_duration  # in ms
+        preamble_duration_ms = AP_PREAMBLE_T  # in ms
         num_periods = 3
         signal_duration_ns = (num_periods+1) * period_ns  # in ns, one more period allow phase shift part finish drawing
         
@@ -398,16 +538,16 @@ class AP:
         # Signal period view (ns scale)
         ax2 = plt.subplot(gs[1])
         relative_t = (signal_t - timestamp - preamble_duration_ms) * 1e6  # in ns
-        equivalent_signal_start = self.signal_start + self.sweep_time * (
-            (timestamp - self.signal_start) // self.sweep_time
+        equivalent_signal_start = self.signal_start + AP_SWEEP_T * (
+            (timestamp - self.signal_start) // AP_SWEEP_T
         )
         
         # Calculate time in sweep phase (after preamble)
         # Convert phase shift to time offset (phase_shift = 2πfΔt => Δt = phase_shift/(2πf))
-        time_in_sweep = timestamp - equivalent_signal_start - self.preamble_duration
-        phase_progress = time_in_sweep / (self.sweep_time - self.preamble_duration)
-        phase_shift = -np.pi/2 + (np.pi / self.phase_shifts_per_sweep) * int(
-            self.phase_shifts_per_sweep * phase_progress)
+        time_in_sweep = timestamp - equivalent_signal_start - AP_PREAMBLE_T
+        phase_progress = time_in_sweep / (AP_SWEEP_T - AP_PREAMBLE_T)
+        phase_shift = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(
+            AP_PHASESHIFT_NUM * phase_progress)
 
         time_offset_ns = (phase_shift / (2 * np.pi * self.freq)) * 1e9
         ax2.plot(relative_t, signal_data, 'b-', alpha=0.8)  # Apply time offset
@@ -447,7 +587,7 @@ class AP:
         print (f"├─ Location: {[round(i, 3) for i in self.location]}")
         print (f"├─ Preamble Duration: {preamble_duration_ms}ms")
         print (f"├─ Signal (sweep) Duration: {signal_duration_ns:.2f}ns")
-        print (f"├─ Phaseshifts per sweep: {self.phase_shifts_per_sweep}")
+        print (f"├─ Phaseshifts per sweep: {AP_PHASESHIFT_NUM}")
         print (f"├─ Carrier Frequency: {self.freq/1e6}MHz")
         print (f"├─ Single Period: {period_ns:.4f}ns")
         print (f"├─ Wavelength: {self.wavelength:.4f}m")
@@ -462,7 +602,7 @@ class AP:
         Verify the signal characteristics at a specific location
         '''
         location = np.array(norm_pos)
-        timestamps = np.arange(0, self.sweep_time, 0.1)  # 0.1ms resolution
+        timestamps = np.arange(0, AP_SWEEP_T, 0.1)  # 0.1ms resolution
         original = []
         attenuated = []
         phases = []
@@ -475,7 +615,7 @@ class AP:
             
             # Actual received signal (with beamforming and attenuation)
             # The signal outputs for every antenna are ampliied to AP_SIGNAL_AMPLITUDE
-            equivalent_signal_start = self.signal_start + self.sweep_time * ((t - self.signal_start) // self.sweep_time)
+            equivalent_signal_start = self.signal_start + AP_SWEEP_T * ((t - self.signal_start) // AP_SWEEP_T)
             attenuation = self.calculate_attenuation(location)
             amp_scale = 10 ** (-(AP_SIGNAL_AMPLITUDE - attenuation)/20)
             actual_amp = self.sample_signal(t, location) * amp_scale
@@ -483,7 +623,7 @@ class AP:
             # print  (AP_SIGNAL_AMPLITUDE, attenuation, amp_scale, actual_amp)
             
             # Simulate the phase shift
-            phase_shift = -np.pi/2 + (np.pi / self.phase_shifts_per_sweep) * int(self.phase_shifts_per_sweep * (t - equivalent_signal_start - self.preamble_duration) / (self.sweep_time - self.preamble_duration))
+            phase_shift = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (t - equivalent_signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
             phases.append(phase_shift)
         
         if (not save_fig): 
@@ -506,12 +646,12 @@ class AP:
         
         theta_values = []
         for t in timestamps:
-            if t < self.preamble_duration: 
+            if t < AP_PREAMBLE_T: 
                 # Preamble phase fixed theta value [the preamble line will not be displayed]
                 theta_values.append(-np.pi/2)
             else:
                 # Calculate the theta value linear change in the scan phase
-                scan_progress = (t - self.preamble_duration) / (self.sweep_time - self.preamble_duration)
+                scan_progress = (t - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T)
                 theta = -np.pi/2 + scan_progress * np.pi
                 theta_values.append(theta)
 
@@ -521,7 +661,7 @@ class AP:
             phases = [(j-1)*np.sin(theta) for theta in theta_values]  # 以π为单位
             
             # Preamble phase [the preamble line will not be displayed]
-            # preamble_mask = [t < self.preamble_duration for t in timestamps]
+            # preamble_mask = [t < AP_PREAMBLE_T for t in timestamps]
             # plt.plot(np.array(timestamps)[preamble_mask], 
             #         np.array(phases)[preamble_mask], 
             #         color='gray', 
@@ -529,7 +669,7 @@ class AP:
             #         alpha=0)
             
             # Scan phase (Sweep phase)
-            scan_mask = [t >= self.preamble_duration for t in timestamps]
+            scan_mask = [t >= AP_PREAMBLE_T for t in timestamps]
             plt.plot(np.array(timestamps)[scan_mask], 
                     np.array(phases)[scan_mask], 
                     linewidth=1.5,
@@ -542,10 +682,10 @@ class AP:
         plt.xlabel("Time (ms)")
         plt.ylabel("Phase (π rad)")
         plt.grid(alpha=0.3)
-        plt.legend()
 
         # Add preamble region annotation
-        plt.axvspan(0, self.preamble_duration, color='gray', alpha=0.2, label='Preamble')
+        plt.axvspan(0, AP_PREAMBLE_T, color='gray', alpha=0.2, label='Preamble stage')
+        plt.legend()
         plt.tight_layout()
         output_dir = f'sim_figures/AP_{self.ap_id}'
         os.makedirs(output_dir, exist_ok=True)
@@ -575,7 +715,7 @@ class AP:
                 phase_diffs[i,j] = self.calculate_beamforming_phase(norm_pos)
 
         # 遍历θ范围（0到2π）
-        theta_values = np.linspace(0, 2*np.pi, self.phase_shifts_per_sweep)
+        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM)
         for theta in theta_values:
             # 复数信号叠加计算
             complex_sum = np.ones((grid_size, grid_size), dtype=complex)  # 参考天线贡献
@@ -588,6 +728,85 @@ class AP:
             mask = amplitudes > max_amplitudes
             max_amplitudes[mask] = amplitudes[mask]
             best_phases[mask] = theta % (2*np.pi)  # 相位归一化
+
+        # Dynamic test point generation
+        max_attempts = 10
+        test_points = []
+        for _ in range(max_attempts): 
+            theta = np.random.uniform(0, 2*np.pi)
+            direction = np.array([np.cos(theta), np.sin(theta)])
+            
+            # Calculate AP center position (normalized)
+            ap_center = self.location / FIELD_SIZE
+            max_step = min(
+                (1 - ap_center[0])/direction[0] if direction[0]>0 else ap_center[0]/-direction[0],
+                (1 - ap_center[1])/direction[1] if direction[1]>0 else ap_center[1]/-direction[1],
+                key=abs
+            ) if not np.allclose(direction, 0) else 0
+            
+            if max_step < 0.2: continue
+            
+            # Generate two test points (distance ≥ 0.2)
+            step1 = np.random.uniform(0.1, max_step-0.1)
+            step2 = step1 + 0.2 + np.random.uniform(0, 0.1)
+            if step2 > max_step:
+                continue
+            
+            p1 = ap_center + direction * step1
+            p2 = ap_center + direction * step2
+            test_points = [p1, p2]
+            break
+        else: 
+            test_points = [
+                np.array([self.location_normalized[0] + 0.1, self.location_normalized[1]]),
+                np.array([self.location_normalized[0] + 0.2, self.location_normalized[1]])
+            ]
+
+        # 存储测试点信息
+        test_info = []
+        for point_idx, norm_pos in enumerate(test_points):
+            print(f"\nTestpoint {point_idx+1} optimal phase calculation:")
+            print(f"├─ Normalized coordinates: ({norm_pos[0]:.3f}, {norm_pos[1]:.3f})")
+            pos_m = norm_pos * FIELD_SIZE
+            print(f"├─ Actual coordinates: ({pos_m[0]:.1f}m, {pos_m[1]:.1f}m)")
+            
+            # Calculate the distance to each antenna
+            print("├─ Antenna distance to test point:")
+            for i, ant_loc in enumerate(self.antenna_locations):
+                dist = np.linalg.norm(pos_m - ant_loc)
+                print(f"│   {'→' if i==0 else ' '} Antenna {i}: {dist:.2f}m" + 
+                     f"{' (referenced distance)' if i==0 else ''}")
+            
+            # Calculate the phase differences
+            phase_diffs = self.calculate_beamforming_phase(norm_pos)
+            print(f"├─ Antenna phase differences: {[round(pd/np.pi, 3) for pd in phase_diffs]}π")
+            
+            # Calculate the optimal θ and signal amplitude
+            max_amp = 0
+            best_theta = 0
+            for theta in np.linspace(0, 2*np.pi, 50):
+                complex_sum = 1.0
+                for pd in phase_diffs:
+                    complex_sum += np.exp(1j*(theta + pd))
+                amp = abs(complex_sum)
+                if amp > max_amp:
+                    max_amp = amp
+                    best_theta = theta
+            
+            # Calculate the attenuation
+            atten = self.calculate_attenuation(norm_pos)
+            print(f"└─ Optimal θ: {best_theta/np.pi:.3f}π")
+            print(f"   ├─ Maximum amplitude: {max_amp:.3f}")
+            print(f"   └─ Total attenuation: {atten:.2f}dB")
+            
+            # 存储计算结果
+            test_info.append({
+                'position': norm_pos,
+                'phase_diffs': [round(float(pd/np.pi),3) for pd in phase_diffs],  # 转换为原生float
+                'best_theta': round(float(best_theta/np.pi),3),
+                'max_amp': round(float(max_amp),3), 
+                'atten': round(float(atten),2)
+            })
 
         # 绘制热力图
         plt.figure(figsize=(12, 10))
@@ -606,7 +825,7 @@ class AP:
                   vmax=2*np.pi,
                   interpolation='bilinear')
         
-        # 配置颜色条
+        # Configure the color bar
         cbar = plt.colorbar(img, 
                            label='Optimal Phase Shift θ (rad)',
                            ticks=np.linspace(0, 2*np.pi, 5),
@@ -617,58 +836,33 @@ class AP:
         # Add environment markers
         self.test_plot_environment_markers()
         
-        plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {self.phase_shifts_per_sweep})")
+        # 标注测试点
+        for info in test_info:
+            # 转换到实际坐标
+            x = info['position'][0] * FIELD_SIZE
+            y = info['position'][1] * FIELD_SIZE
+            
+            # 绘制点
+            plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4)
+            
+            # 生成标注文本
+            text = f"θ*={info['best_theta']}π, ΔΦ={info['phase_diffs']}π\natten={info['atten']}dB"
+            
+            # 动态调整文本位置
+            va = 'bottom' if y < FIELD_SIZE*0.8 else 'top'
+            plt.text(x, y+3, text, 
+                    color='white', fontsize=9,
+                    ha='center', va=va, 
+                    bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
+
+        plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {AP_PHASESHIFT_NUM})")
         plt.xlabel("X (meters)")
         plt.ylabel("Y (meters)")
         
-        
-        
-        # 保存图片
-        save_path = os.path.join(os.path.dirname(__file__), 
-                               f"sim_figures/AP_{self.ap_id}/beamforming_optimal_phases.png")
-        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')  # 白色背景提高对比度
+        # Save the figure
+        save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_optimal_phases.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
-
-        # 选择两个测试点
-        test_points = [
-            np.array([0.5 + 0.1, 0.5]),  # 使用numpy数组确保维度
-            np.array([0.5 - 0.1, 0.5])
-        ]
-        
-        for point_idx, norm_pos in enumerate(test_points):
-            print(f"测试点 {point_idx+1} 详细计算:")
-            print(f"├─ 归一化坐标: ({norm_pos[0]:.3f}, {norm_pos[1]:.3f})")
-            pos_m = norm_pos * FIELD_SIZE  # 直接使用numpy数组运算
-            print(f"├─ 实际坐标: ({pos_m[0]:.1f}m, {pos_m[1]:.1f}m)")
-            
-            # 计算到各天线的距离
-            print("├─ 天线距离计算:")
-            for i, ant_loc in enumerate(self.antenna_locations):
-                dist = np.linalg.norm(pos_m - ant_loc)
-                print(f"│   {'→' if i==0 else ' '} Antenna {i}: {dist:.2f}m" + 
-                     f"{' (参考)' if i==0 else ''}")
-            
-            # 计算相位差
-            phase_diffs = self.calculate_beamforming_phase(norm_pos)
-            print(f"├─ 相位差: {[round(pd/np.pi, 3) for pd in phase_diffs]}π")
-            
-            # 计算最佳θ和信号幅度
-            max_amp = 0
-            best_theta = 0
-            for theta in np.linspace(0, 2*np.pi, 50):
-                complex_sum = 1.0  # 参考天线
-                for pd in phase_diffs:
-                    complex_sum += np.exp(1j*(theta + pd))
-                amp = abs(complex_sum)
-                if amp > max_amp:
-                    max_amp = amp
-                    best_theta = theta
-            
-            # 计算衰减
-            atten = self.calculate_attenuation(norm_pos)
-            print(f"├─ 最佳θ: {best_theta/np.pi:.3f}π")
-            print(f"├─ 最大幅度: {max_amp:.3f}")
-            print(f"└─ 总衰减: {atten:.2f}dB")
 
     def test_plot_environment_markers(self):
         """
@@ -705,10 +899,18 @@ class AP:
         # Add legend
         plt.legend(loc='upper right', framealpha=0.9)
 
+    def get_phase_at_time(self, timestamp):
+        '''
+        获取指定时间点的相位配置
+        '''
+        sweep_index = int((timestamp - self.signal_start) // AP_SWEEP_T)
+        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM)
+        return theta_values[sweep_index % len(theta_values)]
+
 class Simulation:
     def __init__(self, food_sources):
         self.start_time = datetime.datetime.now()
-        self.bees = [Bee(food_sources) for _ in range(NUM_BEES)]
+        self.bees = [Bee(i, food_sources) for i in range(NUM_BEES)]
         self.food_sources = food_sources
         self.frame_count = 0
 
@@ -800,25 +1002,22 @@ class Simulation:
 # Convert normalized coordinates to actual meters
 def to_meters(norm_pos):
     return [norm_pos[0] * FIELD_SIZE, norm_pos[1] * FIELD_SIZE / FIELD_ASPECT_RATIO]
-        
-# Generate APs [STATIC]
+
+# Generate APs
 APs = []
 for i, pos in enumerate(AP_POS_NORM):
     new_AP = AP(i, 
                   (pos[0] * FIELD_SIZE, pos[1] * FIELD_SIZE / FIELD_ASPECT_RATIO),
                   AP_NUM_ANTENNAS, 
                   AP_FREQ, 
-                  AP_PREAMBLES[i], 
-                  sweep_time = AP_SWEEP_T, 
-                  preamble_duration = AP_SWEEP_PREAMBLE_T, 
-                  phase_shifts_per_sweep = AP_PHASESHIFT_NUM)
+                  AP_PREAMBLES[i])
     # All APs are coarsely synchronized using TDMA, 
     # given the same frequency, all APs uniformly distribute the AP_SWEEP_T
     # so that the signal generation is coherent
-    new_AP.set_signal_start((-1 + i / len(AP_POS_NORM)) * AP_SWEEP_T)
+    new_AP.set_signal_start(-i * AP_SWEEP_T)
     APs.append(new_AP)
 
-# Generate food sources [STATIC]
+# Generate food sources
 def generate_valid_location(existing_locations, min_dist=0.05):
     while True:
         pos = np.random.rand(2)
@@ -836,9 +1035,9 @@ for _ in range(NUM_FOOD_SOURCES):
 # Output the environment topology
 print ("\nEnvironment Topology: ")
 print (f"├─ Field Size: {FIELD_SIZE}x{FIELD_SIZE/FIELD_ASPECT_RATIO:.1f} meters")
-print (f"├─ AP Positions (Total {len(APs)}):")
+print (f"├─ AP Positions (Total {AP_NUM}):")
 for i, ap in enumerate(APs):
-    print (f"│   {'├─' if i < len(APs)-1 else '└─'} AP {i}: [{ap.location[0]:.3f}, {ap.location[1]:.3f}] m")
+    print (f"│   {'├─' if i < AP_NUM-1 else '└─'} AP {i}: [{ap.location[0]:.3f}, {ap.location[1]:.3f}] m")
 
 hive_pos_m = (
     HIVE_POS_NORM[0] * FIELD_SIZE,
@@ -862,6 +1061,7 @@ PATH_OBSTACLE_DISTANCE = 1  # Along the path, 1m inside is considered penetrated
 OBSCATLE_ATTENUATION_FACTOR = 50
 FREESPACE_ATTENUATION_FACTOR = 20
 
+# Find NLOS attenuation map
 def plot_attenuation_map(ap_id, attenuation_grid):
     plt.figure(figsize=(10, 8))
     
@@ -993,7 +1193,7 @@ for ap in APs:
         find_nlos()
     ap.load_attenuation_map()
 
-# Run the tests
+# Run the AP tests
 for ap in APs: 
     print (f"\nTest AP{ap.ap_id} Signal Characteristics ...")
     ap.test_signal_characteristics(ap.signal_start)
@@ -1001,8 +1201,6 @@ for ap in APs:
     ap.test_signal_charactertistics_at_location((0.0, 0.0))
     print (f"\nTest AP{ap.ap_id} Beamforming Optimal Phases ...")
     ap.test_beamforming_optimal_phases()
-
-exit(1)  # stop here
 
 
 
@@ -1037,41 +1235,20 @@ food_labels = [ax.text(fs.location_normalized[0], fs.location_normalized[1]+0.02
                       ha='center', va='bottom', color='white', fontsize=8)
               for fs in food_sources]
 legend_elements = [
-    plt.Line2D([0], [0], 
-               marker='o', 
-               color='none', 
-               markerfacecolor='yellow',
-               markersize=10, 
-               label='Bees',
-               alpha=0.7,
-               markeredgewidth=0), 
-    plt.Line2D([0], [0],
-               marker='o',
-               color='none',
-               markerfacecolor='#1E90FF',
-               markersize=10,
-               label='Food',
-               markeredgewidth=0),
-    plt.Line2D([0], [0],
-               marker='s', 
-               color='none',
-               markerfacecolor='green',
-               markersize=10,
-               label='Hive',
-               markeredgewidth=0),
-    plt.Line2D([0], [0],
-               marker='^', 
-               color='none',
-               markerfacecolor='red',
-               markersize=10,
-               label='AP',
-               markeredgewidth=0)
+    plt.Line2D([0], [0], marker='o', color='none', markerfacecolor='yellow', markersize=10, 
+               label='Bees', alpha=0.7, markeredgewidth=0), 
+    plt.Line2D([0], [0], marker='o', color='none', markerfacecolor='#1E90FF', markersize=10,
+               label='Food', markeredgewidth=0),
+    plt.Line2D([0], [0], marker='s', color='none', markerfacecolor='green', markersize=10,
+               label='Hive', markeredgewidth=0),
+    plt.Line2D([0], [0], marker='^', color='none', markerfacecolor='red', markersize=10,
+               label='AP', markeredgewidth=0)
 ]
 ax.legend(handles=legend_elements, loc='upper right')
 
 
 
-# Update the frame
+# Determine how many trail traces to save
 current_frame_id = 0
 trail_save_num = 10
 prev_save_time = 0
@@ -1079,34 +1256,29 @@ if (NUM_FRAMES < 100):
     trail_save_num = math.ceil(NUM_FRAMES / 10)
 
 # Last sample time of each AP
-# Note that the AP start time is not 0
 last_AP_sample_time = [ap.get_signal_start() for ap in APs]
 frame_0_outputed = False
+
+# Update the frame
 def update(frame):
     global current_frame_id, frame_0_outputed
     frame_start = time.perf_counter()
     current_frame_id = frame
     current_time = current_frame_id * FRAME_TIME
 
-    # 传输信号
-    if (not frame_0_outputed): print (f"\nFrame {frame} 开始处理  |  当前时间: {current_time}ms")
-    tx_start = time.perf_counter()
-    transmit_threads = []
-    for ap in APs:
-        while current_time - last_AP_sample_time[ap.ap_id] > ap.sweep_time:
-            thread = threading.Thread(
-                target=ap.transmit_signal,
-                args=(sim.bees, last_AP_sample_time[ap.ap_id]),
-                daemon=True
-            )
-            transmit_threads.append(thread)
-            thread.start()
-            last_AP_sample_time[ap.ap_id] += ap.sweep_time
-    for thread in transmit_threads:
-        thread.join(timeout=0.01)
-    
-    tx_duration = (time.perf_counter() - tx_start) * 1000
-    if (not frame_0_outputed): print (f"信号传输总耗时: {tx_duration:.2f}ms")
+    # Transmit signals
+    if (not frame_0_outputed): print (f"\nFrame {frame} starts processing  |  Current time: {current_time}ms")
+    transmitted = True
+    while transmitted: 
+        transmitted = False
+        for ap in APs: 
+            while current_time - last_AP_sample_time[ap.ap_id] > AP_SWEEP_T: 
+                tx_start = time.perf_counter()
+                ap.transmit_signal(sim.bees, last_AP_sample_time[ap.ap_id])
+                last_AP_sample_time[ap.ap_id] += AP_SWEEP_T * AP_NUM
+                tx_duration = (time.perf_counter() - tx_start) * 1000
+                if (not frame_0_outputed): print (f"AP{ap.ap_id} signal ({round(last_AP_sample_time[ap.ap_id], 1)}ms) transmission: {tx_duration:.2f}ms")
+                transmitted = True
 
     # Update bee history and save the bee trail
     def save_bee_trails(frame, current_time):
@@ -1185,10 +1357,10 @@ def update(frame):
     render_start = time.perf_counter()
     # ...保持渲染代码...
     render_duration = (time.perf_counter() - render_start) * 1000
-    if (not frame_0_outputed): print (f"渲染耗时: {render_duration:.2f}ms")
+    if (not frame_0_outputed): print (f"Render time: {render_duration:.2f}ms")
 
     total_duration = (time.perf_counter() - frame_start) * 1000
-    if (not frame_0_outputed): print (f"Frame {frame} 总耗时: {total_duration:.2f}ms\n")
+    if (not frame_0_outputed): print (f"Frame {frame} total time: {total_duration:.2f}ms\n")
     if (frame == 0): frame_0_outputed = True
     return [bee_scatter, food_scatter] + food_labels
 
@@ -1205,7 +1377,7 @@ ani = FuncAnimation(
 ani.save('sim.gif', 
          writer='pillow', 
          fps=1000//FRAME_TIME,
-         progress_callback=lambda i, n: print (f'Progress: {i+1}/{n} frames', end='\r'))
+         progress_callback=lambda i, n: print (f'\nProgress: {i+1}/{n} frames', end='\r'))
 print ("\nAnimation saved! ")
 plt.close('all')
 os._exit(0)  # 强制终止进程

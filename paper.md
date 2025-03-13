@@ -229,7 +229,7 @@ nized using TDMA so that no two sweeps will interfere with
 each other. We transmit two predeined orthogonal pream-
 bles using ON-OFF keying, [1,0,1,0,1,0,1,0] and [1,1,0,0,1,1,0,0]
 to identify each AP. The preambles are transmitted before
-every sweep of each AP respectively so that the bee can ind
+every sweep of each AP respectively so that the bee can find
 the start of each sweep eiciently. The receiver irst detects
 the preamble using a simple state machine, then runs the
 algorithm twice to get the two angles. Our pseudo-code is
