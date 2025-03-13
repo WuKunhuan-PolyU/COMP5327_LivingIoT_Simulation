@@ -241,18 +241,22 @@ class AP:
                 attenuation_map[(x, y)] = float(atten)
         self.attenuation_map = attenuation_map
 
-    def calculate_beamforming_phase(self, location):
+    def calculate_beamforming_phase(self, position):
         '''
-        修正后的波束成形相位计算（返回每个天线的相位列表）
+        修正为计算相对于参考天线的相位差
+        position: 归一化坐标 [0,1]^2
         '''
-        phases = []
-        for antenna_loc in self.antenna_locations:
-            # 计算到天线的距离（米）
-            distance = np.linalg.norm(location - antenna_loc) * FIELD_SIZE
-            # 相位 = (距离 / 波长) * 2π
-            phase = (distance / self.wavelength) * 2 * np.pi
-            phases.append(phase)
-        return phases  # 返回所有天线的相位列表
+        # 转换到实际坐标（米）
+        position_m = np.array(position) * FIELD_SIZE  # 确保是numpy数组
+        ref_antenna = self.antenna_locations[0]
+        ref_distance = np.linalg.norm(position_m - ref_antenna)
+        phase_diffs = []
+        for antenna_loc in self.antenna_locations[1:]:  # 仅计算相对相位差
+            distance = np.linalg.norm(position_m - antenna_loc)
+            path_diff = distance - ref_distance
+            phase_diff = (path_diff / self.wavelength) * 2 * np.pi
+            phase_diffs.append(phase_diff)
+        return phase_diffs  # 返回N-1个相位差
 
     def calculate_attenuation(self, location):
         '''
@@ -395,7 +399,8 @@ class AP:
         ax2 = plt.subplot(gs[1])
         relative_t = (signal_t - timestamp - preamble_duration_ms) * 1e6  # in ns
         equivalent_signal_start = self.signal_start + self.sweep_time * (
-            (timestamp - self.signal_start) // self.sweep_time)
+            (timestamp - self.signal_start) // self.sweep_time
+        )
         
         # Calculate time in sweep phase (after preamble)
         # Convert phase shift to time offset (phase_shift = 2πfΔt => Δt = phase_shift/(2πf))
@@ -556,44 +561,34 @@ class AP:
         grid_size = 200
         x = np.linspace(0, FIELD_SIZE, grid_size)
         y = np.linspace(0, FIELD_SIZE, grid_size)
-        X, Y = np.meshgrid(x, y)
+        X, Y = np.meshgrid(x, y, indexing='ij')  # 修复网格索引顺序
         
         # 初始化存储矩阵
         max_amplitudes = np.zeros((grid_size, grid_size))
         best_phases = np.zeros((grid_size, grid_size))
         
-        # 预计算所有位置的波束成形相位差（调整为三维数组）
-        beam_phases = np.zeros((grid_size, grid_size, self.antenna_num))
+        # 预计算相位差（调整为N-1维）
+        phase_diffs = np.zeros((grid_size, grid_size, self.antenna_num-1))
         for i in range(grid_size):
             for j in range(grid_size):
-                norm_x = x[i] / FIELD_SIZE
-                norm_y = y[j] / FIELD_SIZE
-                pos = np.array([norm_x, norm_y])
-                beam_phases[i,j,:] = self.calculate_beamforming_phase(pos)  # 存储所有天线相位
-        
-        # 遍历所有可能的相位偏移
-        theta_values = np.linspace(-np.pi/2, np.pi/2, self.phase_shifts_per_sweep)
+                norm_pos = np.array([x[i]/FIELD_SIZE, y[j]/FIELD_SIZE])
+                phase_diffs[i,j] = self.calculate_beamforming_phase(norm_pos)
+
+        # 遍历θ范围（0到2π）
+        theta_values = np.linspace(0, 2*np.pi, self.phase_shifts_per_sweep)
         for theta in theta_values:
-            # 计算当前θ下的总信号幅度（向量化计算）
-            total_phases = theta + beam_phases
-            amplitudes = np.abs(np.sum(np.sin(total_phases), axis=2))  # 对所有天线求和
+            # 复数信号叠加计算
+            complex_sum = np.ones((grid_size, grid_size), dtype=complex)  # 参考天线贡献
+            for k in range(self.antenna_num-1):
+                phase = theta + phase_diffs[:,:,k]  # θ补偿相位差
+                complex_sum += np.exp(1j * phase)   # 复数叠加
+            amplitudes = np.abs(complex_sum)  # 计算模长
             
-            # 更新最大值记录
+            # 更新最大值
             mask = amplitudes > max_amplitudes
             max_amplitudes[mask] = amplitudes[mask]
-            best_phases[mask] = theta
-        
-        # 保存数据到CSV
-        csv_filename = f"beamforming_optimal_phases.csv"
-        csv_path = os.path.join(os.path.dirname(__file__), f"sim_stats/AP_{self.ap_id}", csv_filename)
-        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-        
-        with open(csv_path, 'w') as f:
-            # format: x_m,y_m,optimal_theta,max_amplitude
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    f.write(f"{x[i]:.1f},{y[j]:.1f},{best_phases[i,j]:.3f},{max_amplitudes[i,j]:.3f}\n")
-        
+            best_phases[mask] = theta % (2*np.pi)  # 相位归一化
+
         # 绘制热力图
         plt.figure(figsize=(12, 10))
         
@@ -602,21 +597,21 @@ class AP:
         blues[:, 3] = np.linspace(0.1, 0.6, 256)  # 设置透明度渐变
         cmap = ListedColormap(blues)
 
-        img = plt.imshow(best_phases, 
-                        extent=[0, FIELD_SIZE, 0, FIELD_SIZE],
-                        origin='lower',
-                        cmap=cmap,
-                        aspect='equal',
-                        vmin=-np.pi/2, 
-                        vmax=np.pi/2,
-                        interpolation='bilinear')
+        img = plt.imshow(best_phases.T,  # 转置矩阵以匹配坐标方向
+                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE],
+                  origin='lower',
+                  cmap=cmap,
+                  aspect='equal',
+                  vmin=0, 
+                  vmax=2*np.pi,
+                  interpolation='bilinear')
         
         # 配置颜色条
         cbar = plt.colorbar(img, 
                            label='Optimal Phase Shift θ (rad)',
-                           ticks=np.linspace(-np.pi/2, np.pi/2, 5),
+                           ticks=np.linspace(0, 2*np.pi, 5),
                            extend='both')
-        cbar.set_ticklabels(['-π/2', '-π/4', '0', 'π/4', 'π/2'])
+        cbar.set_ticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
         cbar.outline.set_edgecolor('black')
 
         # Add environment markers
@@ -626,11 +621,54 @@ class AP:
         plt.xlabel("X (meters)")
         plt.ylabel("Y (meters)")
         
+        
+        
         # 保存图片
         save_path = os.path.join(os.path.dirname(__file__), 
                                f"sim_figures/AP_{self.ap_id}/beamforming_optimal_phases.png")
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')  # 白色背景提高对比度
         plt.close()
+
+        # 选择两个测试点
+        test_points = [
+            np.array([0.5 + 0.1, 0.5]),  # 使用numpy数组确保维度
+            np.array([0.5 - 0.1, 0.5])
+        ]
+        
+        for point_idx, norm_pos in enumerate(test_points):
+            print(f"测试点 {point_idx+1} 详细计算:")
+            print(f"├─ 归一化坐标: ({norm_pos[0]:.3f}, {norm_pos[1]:.3f})")
+            pos_m = norm_pos * FIELD_SIZE  # 直接使用numpy数组运算
+            print(f"├─ 实际坐标: ({pos_m[0]:.1f}m, {pos_m[1]:.1f}m)")
+            
+            # 计算到各天线的距离
+            print("├─ 天线距离计算:")
+            for i, ant_loc in enumerate(self.antenna_locations):
+                dist = np.linalg.norm(pos_m - ant_loc)
+                print(f"│   {'→' if i==0 else ' '} Antenna {i}: {dist:.2f}m" + 
+                     f"{' (参考)' if i==0 else ''}")
+            
+            # 计算相位差
+            phase_diffs = self.calculate_beamforming_phase(norm_pos)
+            print(f"├─ 相位差: {[round(pd/np.pi, 3) for pd in phase_diffs]}π")
+            
+            # 计算最佳θ和信号幅度
+            max_amp = 0
+            best_theta = 0
+            for theta in np.linspace(0, 2*np.pi, 50):
+                complex_sum = 1.0  # 参考天线
+                for pd in phase_diffs:
+                    complex_sum += np.exp(1j*(theta + pd))
+                amp = abs(complex_sum)
+                if amp > max_amp:
+                    max_amp = amp
+                    best_theta = theta
+            
+            # 计算衰减
+            atten = self.calculate_attenuation(norm_pos)
+            print(f"├─ 最佳θ: {best_theta/np.pi:.3f}π")
+            print(f"├─ 最大幅度: {max_amp:.3f}")
+            print(f"└─ 总衰减: {atten:.2f}dB")
 
     def test_plot_environment_markers(self):
         """
@@ -956,9 +994,12 @@ for ap in APs:
     ap.load_attenuation_map()
 
 # Run the tests
-for ap in APs:
+for ap in APs: 
+    print (f"\nTest AP{ap.ap_id} Signal Characteristics ...")
     ap.test_signal_characteristics(ap.signal_start)
+    print (f"\nTest AP{ap.ap_id} Signal Characteristics at (0,0) ...")
     ap.test_signal_charactertistics_at_location((0.0, 0.0))
+    print (f"\nTest AP{ap.ap_id} Beamforming Optimal Phases ...")
     ap.test_beamforming_optimal_phases()
 
 exit(1)  # stop here
