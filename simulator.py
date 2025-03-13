@@ -184,7 +184,7 @@ class AP:
                  phase_shifts_per_sweep = 90,  # 根据论文Algorithm 1命名
                  ):
         self.ap_id = ap_id
-        self.location = np.array(location)
+        self.location = np.array(location) # not normalized, in meters
         self.preamble = preamble_signal
 
         # used to calculate the signal
@@ -206,7 +206,6 @@ class AP:
         self.preamble_duration = preamble_duration
 
         # 波束成形相关参数
-        self.current_theta = -np.pi/2  # 当前波束角度
         self.phase_shifts_per_sweep = phase_shifts_per_sweep 
         self.phase_step = np.pi / self.phase_shifts_per_sweep  # δ = π/90 ≈ 2°
         self.antenna_phases = [0.0] * (self.antenna_num + 1)  # 天线编号从1开始
@@ -245,16 +244,15 @@ class AP:
 
     def calculate_beamforming_phase(self, position):
         '''
-        修正后的波束成形相位计算
+        Calculate the beamforming phases for each antenna
+        This only makes up the ϕ component in y(t) = |ax(t) + ae^(j(ϕ−θ)) * x(t)|
         '''
-        total_phase = 0.0
-        for antenna_loc in self.antenna_locations:
-            # 计算到天线的距离（米）
+        antenna_phases = []
+        for antenna_loc in self.antenna_locations: 
             distance = np.linalg.norm(position - antenna_loc) * FIELD_SIZE
-            # 相位 = (距离 / 波长) * 2π
             phase = (distance / self.wavelength) * 2 * np.pi
-            total_phase += phase
-        return total_phase
+            antenna_phases.append(phase)
+        return antenna_phases
 
     def calculate_attenuation(self, position):
         '''
@@ -264,10 +262,9 @@ class AP:
         y = int(position[1] * FIELD_SIZE / FIELD_ASPECT_RATIO)
         return self.attenuation_map.get((x, y), 0.0)
     
-    def sample_signal(self, timestamp, position=None, 
-                      equivalent_signal_start=None):
+    def sample_signal(self, timestamp, position=None): 
         '''
-        Generate a signal with beamforming effect
+        Generate a signal with beamforming effect given the timestamp
         Signal composition: Global phase offset + beamforming phase difference
                  ┌───────────────┐
         Time ──→ │ Phase shifter │──→ Actual signal
@@ -281,22 +278,24 @@ class AP:
         # Global phase offset (due to TDMA scheduling)
         # Calculate the beamformed phase shift <- all the antennas
         # This only applies when the position is given
-        phase_shift = np.radians(self.current_theta)
+        beam_phases = [0 for _ in range(self.antenna_num)]
         if position is not None:
-            delta_phase = self.calculate_beamforming_phase(position)
-            phase_shift += delta_phase
-        if equivalent_signal_start is None:
-            equivalent_signal_start = self.signal_start + self.sweep_time * ((timestamp - self.signal_start) // self.sweep_time)
+            beam_phases = self.calculate_beamforming_phase(position)
+        equivalent_signal_start = self.signal_start + self.sweep_time * ((timestamp - self.signal_start) // self.sweep_time)
         if (timestamp < equivalent_signal_start + self.preamble_duration): 
             # Preamble phase
             return self.preamble[int((timestamp - equivalent_signal_start) / self.preamble_duration * len(self.preamble))]
         else: 
             # Scan phase (Sweep phase)
-            time = (timestamp - equivalent_signal_start - self.preamble_duration)
-            return np.sin(2 * np.pi * self.freq * (time * 1e-3) + phase_shift)
+            # normalize the signal amplitude from all antennas
+            # time * 1e-3 convert unit into seconds in calculation
+            # phase_shift_by_AP is the θ component in y(t) = |ax(t) + ae^(j(ϕ−θ)) * x(t)|
+            sweep_timestamp = timestamp - equivalent_signal_start - self.preamble_duration
+            phase_shift_by_AP = -np.pi/2 + (np.pi / self.phase_shifts_per_sweep) * int(self.phase_shifts_per_sweep * (sweep_timestamp - self.preamble_duration) / (self.sweep_time - self.preamble_duration))
+            return sum([np.sin(2 * np.pi * self.freq * (sweep_timestamp * 1e-3) + phase_shift_by_AP + phase) for phase in beam_phases]) / len(beam_phases)
 
     def transmit_signal(self, bees, transmit_start_time):
-        start_time = time.perf_counter()
+        start_time = time.perf_counter() # test performance
         
         print (f"\nAP{self.ap_id} 开始传输 @ {transmit_start_time}ms")
         print (f"├─ 目标蜜蜂数: {len(bees)}")
@@ -306,10 +305,7 @@ class AP:
         if not bees:
             print ("  → 无目标蜜蜂")
             return
-
-        # 重置波束角度
-        self.current_theta = -np.pi/2
-        self.signal_start = transmit_start_time  # 设置信号起始时间
+        self.signal_start = transmit_start_time
 
         # 生成完整信号时间轴
         timestamps = np.arange(
@@ -351,17 +347,17 @@ class AP:
                          ):
         self.signal_start = timestamp
 
-    def test_signal_characteristics(self, 
-                                    timestamp # in ms
-                                    ):
+    def test_signal_characteristics(self, timestamp):
         '''
-        Generate dual-view signal analysis with separated time scales
+        Generate preamble and actual signal analysis with separated time scales
+        The AP time-dependent phase shift is considered in the figure
         '''
 
         # Find the signal period
         period_ns = 1e9 / self.freq  # in ns
         preamble_duration_ms = self.preamble_duration  # in ms
-        signal_duration_ns = 3 * period_ns  # in ns
+        num_periods = 3
+        signal_duration_ns = (num_periods+1) * period_ns  # in ns, one more period allow phase shift part finish drawing
         
         # Dynamic sampling settings
         samples_preamble = 100  # total preamble samples
@@ -371,7 +367,7 @@ class AP:
         preamble_t = np.linspace(timestamp, timestamp + preamble_duration_ms, samples_preamble)
         signal_t = np.linspace(timestamp + preamble_duration_ms, 
                              timestamp + preamble_duration_ms + signal_duration_ns * 1e-6,  # in ns to ms
-                             3 * samples_per_period)
+                             (num_periods+1) * samples_per_period)
         preamble_data = [self.sample_signal(t) for t in preamble_t]
         signal_data = [self.sample_signal(t) for t in signal_t]
 
@@ -387,7 +383,8 @@ class AP:
                 where='post', 
                 color='#FF4500',
                 linewidth=1.5)
-        ax1.set_title(f"Preamble Digital Signal ({preamble_duration_ms}ms)", pad=6)
+        ax1.set_title(f"Preamble Digital Signal ({preamble_duration_ms}ms)\n"
+                      f"(Record start t: {timestamp}ms)")
         ax1.set_xlabel("Time (ms)")
         ax1.set_ylabel("Digital Level")
         ax1.grid(True, axis='y', linestyle=':')
@@ -395,23 +392,46 @@ class AP:
         ax1.set_ylim(-0.1, 1.1)
         
         # Signal period view (ns scale)
-        # shift the signal timestamp offset so the first timestamp is 0
         ax2 = plt.subplot(gs[1])
         relative_t = (signal_t - timestamp - preamble_duration_ms) * 1e6  # in ns
-        ax2.plot(relative_t, signal_data, 'b-', alpha=0.8)
+        equivalent_signal_start = self.signal_start + self.sweep_time * (
+            (timestamp - self.signal_start) // self.sweep_time)
+        
+        # Calculate time in sweep phase (after preamble)
+        # Convert phase shift to time offset (phase_shift = 2πfΔt => Δt = phase_shift/(2πf))
+        time_in_sweep = timestamp - equivalent_signal_start - self.preamble_duration
+        phase_progress = time_in_sweep / (self.sweep_time - self.preamble_duration)
+        phase_shift = -np.pi/2 + (np.pi / self.phase_shifts_per_sweep) * int(
+            self.phase_shifts_per_sweep * phase_progress)
+
+        time_offset_ns = (phase_shift / (2 * np.pi * self.freq)) * 1e9
+        ax2.plot(relative_t, signal_data, 'b-', alpha=0.8)  # Apply time offset
+        
+        # Draw vertical lines at correct period boundaries
         for i in range(3):
-            t = (i+1)*period_ns
+            t = (i+1)*period_ns - time_offset_ns
             ax2.axvline(t, color='green', linestyle='--', alpha=0.6)
             ax2.text(t-period_ns/2, 0.9, 
                     f'Cycle {i+1}\n({period_ns:.2f}ns)', 
                     ha='center', fontsize=9)
         
+        # Add phase shift mask and legend
+        ax2.axvspan(0, -1 * time_offset_ns, 
+                   facecolor='lightblue', 
+                   alpha=0.3,
+                   label=f'Phase Shift: {phase_shift/np.pi:.2f}π = {time_offset_ns:.2f}ns')
+        ax2.legend(loc='upper right', framealpha=0.9)
+
+        # Set axis limits relative to actual signal
+        ax2.set_xlim(-period_ns*0.1, signal_duration_ns*1.1)
+
         # Create the overall chart
-        ax2.set_title(f"Sinusoidal Wave Detail ({self.freq/1e6}MHz)", pad=6)
+        ax2.set_title(f"Actual Signal({self.freq/1e6}MHz) (AP start t: {timestamp}ms)\n"
+                      f"(Record start t: {timestamp}ms + {preamble_duration_ms}ms (preamble) <= 0ns in the chart)")
         ax2.set_xlabel("Time (ns)")
         ax2.set_ylabel("Amplitude")
         ax2.grid(True, which='both', alpha=0.4)
-        ax2.set_xlim(- period_ns * 0.1, signal_duration_ns * 1.1)
+        ax2.set_xlim(- period_ns * 0.1, signal_duration_ns + period_ns * 0.1 - time_offset_ns)
         ax2.set_ylim(-1.1, 1.1)
         output_dir = f'sim_figures/AP_{self.ap_id}'
         os.makedirs(output_dir, exist_ok=True)
@@ -421,6 +441,8 @@ class AP:
         print (f"\nAccess Point {self.ap_id} Statistics:")
         print (f"├─ Location: {[round(i, 3) for i in self.location]}")
         print (f"├─ Preamble Duration: {preamble_duration_ms}ms")
+        print (f"├─ Signal (sweep) Duration: {signal_duration_ns:.2f}ns")
+        print (f"├─ Phaseshifts per sweep: {self.phase_shifts_per_sweep}")
         print (f"├─ Carrier Frequency: {self.freq/1e6}MHz")
         print (f"├─ Single Period: {period_ns:.4f}ns")
         print (f"├─ Wavelength: {self.wavelength:.4f}m")
@@ -451,7 +473,7 @@ class AP:
             equivalent_signal_start = self.signal_start + self.sweep_time * ((t - self.signal_start) // self.sweep_time)
             attenuation = self.calculate_attenuation(position)
             amp_scale = 10 ** (-(AP_SIGNAL_AMPLITUDE - attenuation)/20)
-            actual_amp = self.sample_signal(t, position, equivalent_signal_start) * amp_scale
+            actual_amp = self.sample_signal(t, position) * amp_scale
             attenuated.append(actual_amp)
             # print  (AP_SIGNAL_AMPLITUDE, attenuation, amp_scale, actual_amp)
             
@@ -526,71 +548,79 @@ class AP:
                   dpi=300, bbox_inches='tight')
         plt.close()
 
-    def test_beamforming_phase(self, theta=None, t=None):
+    def test_beamforming_amplitude(self, theta=None):
         """
-        生成波束成形相位热力图
-        参数：
-            theta - 手动指定的全局相位偏移（弧度）
-            t - 时间戳（自动计算相位偏移）
+        Generate the beamforming amplitude map with the given theta
         """
-        # 确定相位偏移
+        # Determine the phase shift
+        phase_shift = -np.pi/2
         if theta is not None:
             phase_shift = theta
-        elif t is not None:
-            # 计算等效信号起始时间
-            equivalent_signal_start = self.signal_start + self.sweep_time * (
-                (t - self.signal_start) // self.sweep_time)
-            # 计算相位扫描进度
-            phase_progress = (t - equivalent_signal_start - self.preamble_duration) / (
-                self.sweep_time - self.preamble_duration)
-            phase_shift = -np.pi/2 + (np.pi / self.phase_shifts_per_sweep) * int(
-                self.phase_shifts_per_sweep * phase_progress)
-        else:
-            phase_shift = -np.pi/2  # 默认值
 
-        # 创建测试网格（使用实际坐标）
-        grid_size = 200
+        # Create the test grid (using the actual coordinates)
+        grid_size = 101 # consider boundary ceil
         x = np.linspace(0, FIELD_SIZE, grid_size)
-        y = np.linspace(0, FIELD_SIZE, grid_size)  # 保持正方形显示
-        
-        # 计算相位并保存到CSV
+        y = np.linspace(0, FIELD_SIZE, grid_size)
         csv_filename = f"beamforming_phase_theta={round(phase_shift/np.pi, 2):.2f}pi.csv"
         csv_path = os.path.join(os.path.dirname(__file__), f"sim_stats/AP_{self.ap_id}", csv_filename)
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         
-        phase_map = np.zeros((grid_size, grid_size))
+        amplitude_map = np.zeros((grid_size, grid_size))
         with open(csv_path, 'w') as f:
-            f.write("x_m,y_m,phase_rad\n")  # CSV头部
-            
             for i in range(grid_size):
-                for j in range(grid_size):
-                    # 转换为归一化坐标（0-1范围）
+                for j in range(grid_size): 
                     norm_x = x[i] / FIELD_SIZE
                     norm_y = y[j] / FIELD_SIZE
                     pos = np.array([norm_x, norm_y])
-                    
-                    beam_phase = self.calculate_beamforming_phase(pos)
-                    total_phase = phase_shift + beam_phase
-                    phase_map[i,j] = (total_phase + np.pi) % (2*np.pi) - np.pi
-                    
-                    # 写入CSV
-                    f.write(f"{x[i]:.1f},{y[j]:.1f},{phase_map[i,j]:.3f}\n")
+                    beam_phases = self.calculate_beamforming_phase(pos)
+                    amplitude_map[i,j] = sum([np.sin(phase_shift + phase) for phase in beam_phases]) / len(beam_phases)
+                    f.write(f"{x[i]:.1f},{y[j]:.1f},{amplitude_map[i,j]:.3f}\n")
 
         # 绘制热力图
         plt.figure(figsize=(10, 8))
-        plt.imshow(phase_map, 
-                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE],  # 显示完整100x100米
+        plt.imshow(amplitude_map, 
+                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE],
                   origin='lower',
-                  cmap='viridis',
-                  aspect='equal')  # 保持1:1宽高比
+                  cmap='Blues', 
+                  aspect='equal')
         
-        # 修正天线位置标记
-        for loc in self.antenna_locations:
-            actual_x = loc[0] * FIELD_SIZE
-            actual_y = loc[1] * FIELD_SIZE
-            plt.scatter(actual_x, actual_y, c='red', s=50, zorder=2)
+        # 标注当前AP
+        ap_loc = self.location
+        plt.scatter(ap_loc[0], ap_loc[1], 
+                   marker='^', s=200, c='red', 
+                   edgecolors='white', label=f'AP {self.ap_id}')
         
-        plt.title(f"Beamforming Phase Map @ AP{self.ap_id}\n"
+        # 标注其他AP
+        for i, ap in enumerate(APs):
+            if i != self.ap_id:
+                other_loc = ap.location
+                plt.scatter(other_loc[0], other_loc[1], 
+                           marker='^', s=120, c='red',
+                           alpha=0.5)
+        
+        # 标注蜂巢
+        hive_pos_m = (HIVE_POS[0]*FIELD_SIZE, HIVE_POS[1]*FIELD_SIZE)
+        plt.scatter(hive_pos_m[0], hive_pos_m[1], 
+                   marker='s', s=120, c='green', 
+                   alpha=0.5)
+        
+        # 标注蜜源
+        for fs in food_sources:
+            fs_pos = (fs.position[0]*FIELD_SIZE, 
+                     fs.position[1]*FIELD_SIZE)
+            plt.scatter(fs_pos[0], fs_pos[1], 
+                       marker='o', s=80, c='blue',
+                       alpha=0.5)
+        
+        # 添加图例和坐标轴
+        plt.legend(loc='upper right')
+        
+        # 添加colorbar
+        cbar = plt.colorbar(label='Total Phase (rad)')
+        cbar.set_ticks(np.linspace(-np.pi, np.pi, 7))
+        cbar.set_ticklabels(['-π', '-2π/3', '-π/3', '0', 'π/3', '2π/3', 'π'])
+
+        plt.title(f"Beamforming Amplitude Map @ AP{self.ap_id}\n"
                  f"Antenna Phase Shift θ: {phase_shift/np.pi:.2f}π")
         plt.xlabel("X (m)")
         plt.ylabel("Y (m)")
@@ -774,8 +804,8 @@ def plot_attenuation_map(ap_id, attenuation_grid):
                linewidths=0.3, 
                alpha=0.5)
     
-    # 调整colorbar（移除update_normal）
-    cbar = plt.colorbar(img, label='Total Attenuation (dB)')  # 直接关联img对象更安全
+    # 调整colorbar
+    cbar = plt.colorbar(img, label='Total Attenuation (dB)')
     cbar.set_ticks(np.linspace(0, vmax, 10))
     cbar.outline.set_edgecolor('black')
     plt.setp(cbar.ax.yaxis.get_ticklines(), color='black')
@@ -911,7 +941,7 @@ for ap in APs:
 for ap in APs:
     ap.test_signal_characteristics(ap.signal_start)
     ap.test_signal_charactertistics_at_position((0.0, 0.0))
-    ap.test_beamforming_phase()
+    ap.test_beamforming_amplitude()
 
 exit(1)  # stop here
 
