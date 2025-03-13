@@ -93,6 +93,16 @@ class Bee:
         self.signal_memory_debug_count = 0
         self.signal_receive_plotted = False
 
+        # 前导码参数预计算
+        self.bit_duration = AP_PREAMBLE_T / len(AP_PREAMBLES[0])  # 每个比特持续时间
+        self.preamble_states = {
+            'idle': 0,
+            'detecting': 1,
+            'verifying': 2
+        }
+        self.current_preamble_state = self.preamble_states['idle']
+        self.detected_bits = []
+        self.detection_start_time = None
 
     def reset_knowledge(self):
         self.known_empty_sources.clear()
@@ -104,41 +114,60 @@ class Bee:
     
     def detect_preamble_signal(self, samples):
         '''
-        改进前导码检测逻辑
+        基于时间窗口和相对振幅的轻量级前导码检测
         '''
-        preamble_length = len(AP_PREAMBLES[0])
-        # 计算预期前导码持续时间对应的样本数
-        expected_preamble_samples = int(AP_PREAMBLE_T * AP_SAMPLE_RATE / 1000)
-        if len(samples) < expected_preamble_samples:
-            return None
+        bit_duration = AP_PREAMBLE_T / len(AP_PREAMBLES[0])
+        min_stable_time = 0.3 * bit_duration  # 至少稳定0.3ms视为有效比特
         
-        # 滑动窗口检测
-        best_match = {'ap_id': -1, 'count': 0, 'start': 0}
-        for offset in range(len(samples) - expected_preamble_samples + 1):
-            window = samples[offset:offset+expected_preamble_samples]
-            max_amp = max(s[1] for s in window)
-            threshold = 0.5 * max_amp  # 50%幅度作为阈值
-            symbols = [int(s[1] > threshold) for s in window]
-            
-            # 匹配所有AP的前导码
-            for ap_id, preamble in enumerate(AP_PREAMBLES):
-                matched = 0
-                step = expected_preamble_samples // preamble_length  # 精确步长
-                for i in range(preamble_length):
-                    pos = i * step
-                    if pos < len(symbols) and abs(symbols[pos] - preamble[i]) < 0.5:  # 允许幅度误差
-                        matched += 1
-                
-                if matched > best_match['count']:
-                    best_match.update({
-                        'ap_id': ap_id,
-                        'count': matched,
-                        'start': samples[offset][0]
-                    })
-        
-        if best_match['count'] >= preamble_length * 0.9:  # 提高匹配阈值
-            return (best_match['start'], best_match['ap_id'])
+        # 第一步：检测可能的起始比特
+        stable_start = None
+        current_max = None
+        for i in range(len(samples)-1):
+            current_ts, current_amp = samples[i]
+            next_ts, _ = samples[i+1]
+            if stable_start is None:
+                stable_start = current_ts
+                current_max = current_amp
+            else: 
+                current_max = max(current_max, current_amp)
+                rel_amp = current_amp / current_max
+                if (current_ts - stable_start) >= min_stable_time: 
+                    sampled_bits = []
+                    start_time = stable_start
+
+                    # Estimate the sampling gap of preamble signals
+                    expected_samples_per_bit = bit_duration / (next_ts - current_ts)
+                    if i + int((len(AP_PREAMBLES[0])-1) * expected_samples_per_bit) >= len(samples):
+                        print (f"sample length is not enough: {len(samples)}, expected at least {i + int((len(AP_PREAMBLES[0])-1) * expected_samples_per_bit)}")
+                        return None # sample length is not enough
+                    
+                    # Verify the detected bits
+                    for bit_idx in range(len(AP_PREAMBLES[0])): 
+                        sampled_bits.append(samples[i + int(bit_idx * expected_samples_per_bit)][1])
+                    try: 
+                        detected_bits = np.array(sampled_bits)
+                        detected_bits += np.min(detected_bits)
+                        detected_bits /= np.max(detected_bits)
+                        detected_bits = np.where((-0.1 < detected_bits) & (detected_bits < 0.1), 0, detected_bits)
+                        detected_bits = np.where((0.9 < detected_bits) & (detected_bits < 1.1), 1, detected_bits)
+                        detected_bits = tuple(detected_bits)
+                        ap_id = AP_PREAMBLES.index(detected_bits)
+                        if self.signal_memory_debug_count <= 3:
+                            print(f"\nBee {self.bee_id} detected preamble @ {stable_start:.2f}ms")
+                            print(f"├─ AP ID: {ap_id}")
+                            print(f"└─ Sampled bits: {np.round(np.array(sampled_bits), 5)}")
+                        return (start_time, ap_id)
+                    except Exception as _: 
+                        return None # detected bits are not valid
+                elif abs(rel_amp - 1.0) >= 0.1: 
+                    stable_start = None
+                    current_max = None
         return None
+
+    def _reset_preamble_state(self):
+        self.current_preamble_state = self.preamble_states['idle']
+        self.detected_bits = []
+        self.detection_start_time = None
 
     def find_angle_from_max_amplitude(self, signal_segment, ap_id):
         # 找到最大幅度对应的相位索引
@@ -157,7 +186,10 @@ class Bee:
         theta = -np.pi/2 + (2*np.pi / AP_PHASESHIFT_NUM) * phase_index
         wavelength = 3e8 / AP_FREQ
         phase_diff = theta * wavelength / (2 * np.pi)
-        angle = np.arcsin(phase_diff / (0.5 * wavelength))  # 假设天线间距为半波长
+        ratio = phase_diff / (0.5 * wavelength)
+        # 处理浮点误差导致的数值溢出
+        safe_ratio = np.clip(ratio, -1.0, 1.0)
+        angle = np.arcsin(safe_ratio)
         return np.degrees(angle)
 
     def plot_received_signal(self, bee_id, signal_memory, mark = False):
@@ -200,10 +232,11 @@ class Bee:
         Store the received signal data, keep the last 3 sweep periods
         '''
         new_data = list(zip(timestamps, samples))
+        self.signal_memory_debug_count += 1
         
         # format: timestamp,amplitude
         if (len(new_data) > 0): 
-            if (self.signal_memory_debug_count < 3): 
+            if (self.signal_memory_debug_count <= 3): 
                 self.data_dir = f"sim_stats/bee_{self.bee_id:02d}"
                 os.makedirs(self.data_dir, exist_ok=True)
                 with open(f"{self.data_dir}/received_signal_raw_{self.signal_memory_debug_count}.csv", "w") as f:
@@ -214,49 +247,52 @@ class Bee:
         # Merge and check whether sorted
         # i.e., if the signal memory is not empty, 
         # verify whether the new data is sorted, otherwise discard the observation
-        if (len(self.signal_memory) > 0):
+        if (len(self.signal_memory) > 0): 
             if (new_data[0][0] < self.signal_memory[-1][0]):
                 print (f"Bee {id(self)} received signal ({new_data[0][0]:.2f}ms - {new_data[-1][0]:.2f}ms): Unsorted timestamps (latest received: {self.signal_memory[-1][0]:.2f}ms)")
                 return
+
         self.signal_memory.extend(new_data)
         before_crop_len = len(self.signal_memory)
 
-        # Process the signal memory, only preserve the last (num_APs + 1) * T samples
-        # e.g., if there are 2 APs, the last 3T samples are preserved
-        # crop the memory using the timestamp instead of the index
-        preserve_duration = (AP_NUM + 1) * AP_SWEEP_T * AP_SAMPLE_RATE / 1000
-        first_preserved_timestamp = self.signal_memory[-1][0] - preserve_duration
-        max_samples_per_sweep = AP_SAMPLE_RATE * AP_SWEEP_T / 1000
-        min_timestamp_index = len(self.signal_memory) - 1 - (AP_NUM + 1) * max_samples_per_sweep
-        if (min_timestamp_index < 0): 
-            min_timestamp_index = 0
-        actual_timestamp_at_crop = self.signal_memory[min_timestamp_index][0]
-        if (actual_timestamp_at_crop < first_preserved_timestamp):
-            left, right = min_timestamp_index, len(self.signal_memory) - 1
-            while left < right:
-                mid = (left + right) // 2
-                if (self.signal_memory[mid][0] < first_preserved_timestamp):
-                    left = mid + 1
-                else:
-                    right = mid
-            self.signal_memory = self.signal_memory[left:]
-        else: 
-            self.signal_memory = self.signal_memory[min_timestamp_index:]
-        after_crop_len = len(self.signal_memory)
-        actual_timestamp_at_crop = self.signal_memory[0][0] if self.signal_memory else None
 
-        # As one sweep can only have at most one AP transmitting, 
-        # the length of detected max amplitudes is at most AP_NUM
-        self.signal_memory_ap_angles = self.signal_memory_ap_angles[-AP_NUM:]
-        while (self.signal_memory_ap_angles and actual_timestamp_at_crop and 
-               self.signal_memory_ap_angles[0][0] < actual_timestamp_at_crop):
-            self.signal_memory_ap_angles.pop(0)
 
+        # 处理信号内存裁剪
+        preserve_duration = (AP_NUM + 1) * AP_SWEEP_T
+        first_preserved_timestamp = self.signal_memory[-1][0] - preserve_duration if self.signal_memory else None
+        
+        # Prior-knowledge guess to cut the first len(new_data) samples
+        # General method is to use binary search to find the first timestamp
+        if (len(self.signal_memory) > 0 and 
+            self.signal_memory[0][0] < first_preserved_timestamp): 
+            if (len(self.signal_memory) > len(new_data) and 
+                self.signal_memory[len(new_data) - 1][0] < first_preserved_timestamp and 
+                self.signal_memory[len(new_data)][0] >= first_preserved_timestamp):
+                self.signal_memory = self.signal_memory[len(new_data):]
+                if (self.signal_memory_debug_count < 3): print  (f"CROP the memory using prior knowledge (start from {len(new_data)})")
+            else:
+                left, right = len(new_data), len(self.signal_memory)
+                while left < right:
+                    mid = (left + right) // 2
+                    if (first_preserved_timestamp is not None) and (self.signal_memory[mid][0] < first_preserved_timestamp):
+                        left = mid + 1
+                    else:
+                        right = mid
+                self.signal_memory = self.signal_memory[left:] if left < len(self.signal_memory) else []
+                if (self.signal_memory_debug_count < 3): print  (f"CROP the memory using binary search (start from {left})")
+
+        # Cut the preambles and angles memory at the same time
+        # Not too costly, as each sweep period => only 1 statistics saved, 
+        # so just perform linear search
+        self.signal_memory_preambles = [p for p in self.signal_memory_preambles if p[0] >= first_preserved_timestamp]
+        self.signal_memory_ap_angles = [a for a in self.signal_memory_ap_angles if a[0] >= first_preserved_timestamp]
+
+        # Search for new preambles in the new data
         # "locate preamble2 in S_(i+T) .. S_(3T) at i" indicates that preamble pairs should 
         # have at least T time gap between them
         # According to the paper, detection can start from the last preamble end even recorded
         # the new data must be preserved (not cropped due to exceeding the time limit)
-        assert (len(self.signal_memory) >= len(new_data))
+        assert (len(self.signal_memory) >= len(new_data)), f"len(self.signal_memory): {len(self.signal_memory)}, len(new_data): {len(new_data)}"
         preamble_search_index = len(self.signal_memory) - len(new_data)
         preamble_detection = None
         while (self.signal_memory_preambles and preamble_search_index < len(self.signal_memory) and
@@ -269,39 +305,35 @@ class Bee:
                 self.signal_memory_preambles.append(result)
 
         # Process the signal segment after preamble
-        for ts, ap_id in self.signal_memory_preambles:
-            # Find the signal segment after preamble
+        for ts, ap_id in self.signal_memory_preambles: 
             start_idx = next(i for i, s in enumerate(self.signal_memory) if s[0] >= ts + AP_PREAMBLE_T)
             end_time = ts + AP_SWEEP_T
             signal_segment = [s for s in self.signal_memory[start_idx:] if s[0] <= end_time]
             
-            # Calculate the angle
+            # Calculate the optimal phase shift angle that maximizes the amplitude
             angle = self.find_angle_from_max_amplitude(signal_segment, ap_id)
-            if angle and not self.signal_receive_plotted:
+            print  (f"\nsignal_segment: {[(i[0], np.round(i[1], 5)) for i in signal_segment]}")
+            print  (f"└─ Found angle: {angle} for AP{ap_id} at {ts:.2f}ms sweep. ")
+            if angle: 
                 self.signal_memory_ap_angles.append( (ts + AP_PREAMBLE_T, ap_id, angle) )
-                self.signal_receive_plotted = True
 
-        # Export the signal memory to a csv file
-        if (self.signal_memory_debug_count < 3 and len(timestamps) > 0):
+        # Output the signal receive information
+        if (self.signal_memory_debug_count < 30 and 
+            self.signal_memory_debug_count % 10 == 9 and 
+            len(timestamps) > 0):
             print (f"\nBee {self.bee_id} received signal")
             print (f"├─ First timestamp: {timestamps[0]:.2f}ms")
             print (f"├─ Last timestamp: {timestamps[-1]:.2f}ms")
             duration = timestamps[-1] - timestamps[0]
             print (f"├─ Duration: {duration:.2f}ms")
             print (f"├─ Num of new samples: {len(new_data)}")
-            print (f"├─ Num of deleted samples: {before_crop_len - after_crop_len}")
+            print (f"├─ Num of deleted samples: {before_crop_len - len(self.signal_memory)}")
             print (f"├─ Num of stored samples: {len(self.signal_memory)}")
             if (preamble_detection): 
                 print (f"├─ AP detected from preamble: {preamble_detection}")
-            print (f"└─ AP angles: {self.signal_memory_ap_angles}")
-
-        # Plot when keeping received signal and the memory overflows
-        if first_preserved_timestamp > 0 and not self.signal_receive_plotted:
+            print (f"└─ AP angles: {np.round(np.array(self.signal_memory_ap_angles), 3)}")
             self.plot_received_signal(self.bee_id, self.signal_memory, mark = True)
             self.signal_receive_plotted = True
-        
-        self.signal_memory_debug_count += 1
-        
 
     def sample_location_history(self):
         pass
@@ -346,8 +378,6 @@ class AP:
 
         # Preload NLOS attenuation data and base signal template
         self.attenuation_map = None
-        t = np.linspace(0, 1/self.freq, int(AP_SAMPLE_RATE/self.freq))
-        self.base_signal = np.sin(2 * np.pi * self.freq * t)
         
         # Performance counters
         self.preamble_sample_count = 0
@@ -460,12 +490,12 @@ class AP:
         修复为返回（时间轴，样本列表）
         '''
         # 分阶段生成时间轴
-        preamble_samples = 5 * len(AP_PREAMBLES[0])
+        preamble_samples = 10 * len(AP_PREAMBLES[0])
         scan_samples = AP_PHASESHIFT_NUM
         
         # 生成时间轴
-        preamble_ts = np.linspace(sweep_start, sweep_start+AP_PREAMBLE_T, preamble_samples)
-        scan_ts = np.linspace(sweep_start+AP_PREAMBLE_T, sweep_start+AP_SWEEP_T, scan_samples)
+        preamble_ts = np.linspace(sweep_start, sweep_start+AP_PREAMBLE_T, preamble_samples, endpoint=False)
+        scan_ts = np.linspace(sweep_start+AP_PREAMBLE_T, sweep_start+AP_SWEEP_T, scan_samples, endpoint=False)
         timestamps = np.concatenate([preamble_ts, scan_ts]).tolist()
         
         # 生成每个时间点的信号
@@ -508,10 +538,10 @@ class AP:
         samples_per_period = 1000  # samples per period
         
         # Generate test signal data
-        preamble_t = np.linspace(timestamp, timestamp + preamble_duration_ms, samples_preamble)
+        preamble_t = np.linspace(timestamp, timestamp + preamble_duration_ms, samples_preamble, endpoint=False)
         signal_t = np.linspace(timestamp + preamble_duration_ms, 
                              timestamp + preamble_duration_ms + signal_duration_ns * 1e-6,  # in ns to ms
-                             (num_periods+1) * samples_per_period)
+                             (num_periods+1) * samples_per_period, endpoint=False)
         preamble_data = [self.sample_signal(t) for t in preamble_t]
         signal_data = [self.sample_signal(t) for t in signal_t]
 
@@ -698,9 +728,9 @@ class AP:
         Generate the beamforming maximum amplitude mapping to phase shifts
         """
         # Create the test grid
-        grid_size = 200
-        x = np.linspace(0, FIELD_SIZE, grid_size)
-        y = np.linspace(0, FIELD_SIZE, grid_size)
+        grid_size = 201 # handle the edge case
+        x = np.linspace(0, FIELD_SIZE, grid_size, endpoint=True)
+        y = np.linspace(0, FIELD_SIZE, grid_size, endpoint=True)
         X, Y = np.meshgrid(x, y, indexing='ij')  # 修复网格索引顺序
         
         # 初始化存储矩阵
@@ -715,7 +745,7 @@ class AP:
                 phase_diffs[i,j] = self.calculate_beamforming_phase(norm_pos)
 
         # 遍历θ范围（0到2π）
-        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM)
+        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM, endpoint=False)
         for theta in theta_values:
             # 复数信号叠加计算
             complex_sum = np.ones((grid_size, grid_size), dtype=complex)  # 参考天线贡献
@@ -784,7 +814,7 @@ class AP:
             # Calculate the optimal θ and signal amplitude
             max_amp = 0
             best_theta = 0
-            for theta in np.linspace(0, 2*np.pi, 50):
+            for theta in np.linspace(0, 2*np.pi, 50, endpoint=False):
                 complex_sum = 1.0
                 for pd in phase_diffs:
                     complex_sum += np.exp(1j*(theta + pd))
@@ -812,8 +842,8 @@ class AP:
         plt.figure(figsize=(12, 10))
         
         # 创建自定义颜色映射（包含alpha通道）
-        blues = plt.cm.Blues(np.linspace(0.1, 0.9, 256))  # 调整颜色范围
-        blues[:, 3] = np.linspace(0.1, 0.6, 256)  # 设置透明度渐变
+        blues = plt.cm.Blues(np.linspace(0.1, 0.9, 256 + 1))  # 调整颜色范围
+        blues[:, 3] = np.linspace(0.1, 0.6, 256 + 1)  # 设置透明度渐变
         cmap = ListedColormap(blues)
 
         img = plt.imshow(best_phases.T,  # 转置矩阵以匹配坐标方向
@@ -828,7 +858,7 @@ class AP:
         # Configure the color bar
         cbar = plt.colorbar(img, 
                            label='Optimal Phase Shift θ (rad)',
-                           ticks=np.linspace(0, 2*np.pi, 5),
+                           ticks=np.linspace(0, 2*np.pi, 5, endpoint=True),
                            extend='both')
         cbar.set_ticklabels(['0', 'π/4', 'π/2', '3π/4', 'π'])
         cbar.outline.set_edgecolor('black')
@@ -904,7 +934,7 @@ class AP:
         获取指定时间点的相位配置
         '''
         sweep_index = int((timestamp - self.signal_start) // AP_SWEEP_T)
-        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM)
+        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM, endpoint=False)
         return theta_values[sweep_index % len(theta_values)]
 
 class Simulation:
@@ -1076,7 +1106,7 @@ def plot_attenuation_map(ap_id, attenuation_grid):
     
     # 添加等高线
     X, Y = np.meshgrid(np.arange(FIELD_SIZE), np.arange(int(FIELD_SIZE/FIELD_ASPECT_RATIO)))
-    levels = np.linspace(0, vmax, 15)
+    levels = np.linspace(0, vmax, 15 + 1)
     plt.contour(X, Y, attenuation_grid.T, 
                levels=levels, 
                colors='white', 
@@ -1085,7 +1115,7 @@ def plot_attenuation_map(ap_id, attenuation_grid):
     
     # 调整colorbar
     cbar = plt.colorbar(img, label='Total Attenuation (dB)')
-    cbar.set_ticks(np.linspace(0, vmax, 10))
+    cbar.set_ticks(np.linspace(0, vmax, 10 + 1))
     cbar.outline.set_edgecolor('black')
     plt.setp(cbar.ax.yaxis.get_ticklines(), color='black')
 
