@@ -85,8 +85,8 @@ class Bee:
         self.known_empty_sources = set() # Local memory of empty food sources
         self.history = []  # Record location and time
         self.signal_memory = [] # Record the signal memory. Format: [(timestamp, amplitude), ...]
-        self.signal_memory_preambles = [] # Record preamble signal's first timestamp. Format: [(timestamp, ap_id), ...]
-        self.signal_memory_ap_angles = []  # Record the AP angle from max amplitude timestamps after each preamble. Format: [(timestamp, ap_id, angle), ...]
+        self.signal_memory_preambles = [] # Record preamble signal's timestamp. Format: [((start_timestamp, ap_id), sampled_timestamp_amps), ...]
+        self.signal_memory_ap_angles = []  # Record the AP angle from max amplitude timestamps. Format: [((max_amp_timestamp, ap_id), angle), ...]
         self.signal_received_count = 0
 
         # testing purposes
@@ -103,6 +103,9 @@ class Bee:
         self.current_preamble_state = self.preamble_states['idle']
         self.detected_bits = []
         self.detection_start_time = None
+
+        # Quick-access variables
+        self.sweep_interval = AP_SWEEP_T * AP_NUM
 
     def reset_knowledge(self):
         self.known_empty_sources.clear()
@@ -132,6 +135,7 @@ class Bee:
                 current_max = max(current_max, current_amp)
                 rel_amp = current_amp / current_max
                 if (current_ts - stable_start) >= min_stable_time: 
+                    sampled_timestamp_amps = []
                     sampled_bits = []
                     start_time = stable_start
 
@@ -144,19 +148,31 @@ class Bee:
                     # Verify the detected bits
                     for bit_idx in range(len(AP_PREAMBLES[0])): 
                         sampled_bits.append(samples[i + int(bit_idx * expected_samples_per_bit)][1])
+                        sampled_timestamp_amps.append(samples[i + int(bit_idx * expected_samples_per_bit)])
                     try: 
                         detected_bits = np.array(sampled_bits)
-                        detected_bits += np.min(detected_bits)
-                        detected_bits /= np.max(detected_bits)
+                        detected_min = np.min(detected_bits)
+                        detected_bits -= detected_min
+                        detected_range = np.max(detected_bits) # note that min is 0 now
+                        detected_bits /= detected_range
                         detected_bits = np.where((-0.1 < detected_bits) & (detected_bits < 0.1), 0, detected_bits)
                         detected_bits = np.where((0.9 < detected_bits) & (detected_bits < 1.1), 1, detected_bits)
                         detected_bits = tuple(detected_bits)
-                        ap_id = AP_PREAMBLES.index(detected_bits)
+                        ap_id = AP_PREAMBLES.index(detected_bits) # will throw an error if not found
+                        # Find the exact ending sample id for the preamble
+                        end_idx = i + int((len(AP_PREAMBLES[0])-1) * expected_samples_per_bit)
+                        while (end_idx < len(samples)): 
+                            current_bit = samples[end_idx][1]
+                            normalized_last_preamble_bit = (sampled_bits[-1] - detected_min) / detected_range
+                            normalized_current_bit = (current_bit - detected_min) / detected_range
+                            if (normalized_last_preamble_bit != normalized_current_bit):
+                                break
+                            end_idx += 1 # find the exact ending sample id for the preamble
                         if self.signal_memory_debug_count <= 3:
                             print(f"\nBee {self.bee_id} detected preamble @ {stable_start:.2f}ms")
                             print(f"├─ AP ID: {ap_id}")
                             print(f"└─ Sampled bits: {np.round(np.array(sampled_bits), 5)}")
-                        return (start_time, ap_id)
+                        return (start_time, ap_id), sampled_timestamp_amps, end_idx
                     except Exception as _: 
                         return None # detected bits are not valid
                 elif abs(rel_amp - 1.0) >= 0.1: 
@@ -175,53 +191,75 @@ class Bee:
         max_time = signal_segment[max_idx][0]
         
         # 通过预存参数计算相位
-        sweep_interval = AP_SWEEP_T * AP_NUM  # 总扫描周期
-        sweep_start = (max_time // sweep_interval) * sweep_interval
+        sweep_start = (max_time // self.sweep_interval) * self.sweep_interval
         phase_index = int(
             (max_time - sweep_start - AP_PREAMBLE_T) / 
             (AP_SWEEP_T - AP_PREAMBLE_T) * AP_PHASESHIFT_NUM
         ) % AP_PHASESHIFT_NUM
         
         # 根据相位索引计算角度
-        theta = -np.pi/2 + (2*np.pi / AP_PHASESHIFT_NUM) * phase_index
+        theta = -np.pi/2 + np.pi * phase_index / AP_PHASESHIFT_NUM
         wavelength = 3e8 / AP_FREQ
         phase_diff = theta * wavelength / (2 * np.pi)
         ratio = phase_diff / (0.5 * wavelength)
+        
         # 处理浮点误差导致的数值溢出
         safe_ratio = np.clip(ratio, -1.0, 1.0)
         angle = np.arcsin(safe_ratio)
-        return np.degrees(angle)
+        return (max_time, ap_id), np.degrees(angle), signal_segment[max_idx][1]
 
-    def plot_received_signal(self, bee_id, signal_memory, mark = False):
+    def plot_received_signal(self, bee_id, signal_data, mark=False):
         '''
         Plot the received signal from all APs
         '''
-        if not signal_memory: return
+        if not signal_data: return
         
         plt.figure(figsize=(12, 6))
-        times = [s[0] for s in signal_memory]
-        amps = [s[1] for s in signal_memory]
+        times = [s[0] for s in signal_data]
+        amps = [s[1] for s in signal_data]
         
         # Plot the raw signal
         plt.plot(times, amps, 'b-', alpha=0.3, label='Raw Signal')
         if (mark): 
-            # Mark the preamble region
-            for ts, ap_id in self.signal_memory_preambles:
-                start = ts
-                end = start + AP_PREAMBLE_T
-                plt.axvspan(start, end, alpha=0.2, color=['red','blue'][ap_id], label=f'AP{ap_id} Preamble')
+            # Mark the preamble region and the sampling points
+            plotted_preambles = []
+            preamble_sample_labelled = False
+            labelled_angle_aps = []
+            for ts_and_ap_id, sampled_timestamp_amps in self.signal_memory_preambles:
+                start = sampled_timestamp_amps[0][0]
+                end = sampled_timestamp_amps[-1][0]
+                if ts_and_ap_id[1] not in plotted_preambles:
+                    plt.axvspan(start, end, alpha=0.2, color=['red','blue'][ts_and_ap_id[1]], label=f'AP{ts_and_ap_id[1]} Preamble')
+                    plotted_preambles.append(ts_and_ap_id[1])
+                else: 
+                    plt.axvspan(start, end, alpha=0.2, color=['red','blue'][ts_and_ap_id[1]])
+                if not preamble_sample_labelled:
+                    plt.scatter([sample[0] for sample in sampled_timestamp_amps], 
+                                [sample[1] for sample in sampled_timestamp_amps], 
+                                c='red', s=30, zorder=3, 
+                                label='Preamble Samples')
+                    preamble_sample_labelled = True
+                else: 
+                    plt.scatter([sample[0] for sample in sampled_timestamp_amps], 
+                                [sample[1] for sample in sampled_timestamp_amps], 
+                                c='red', s=30, zorder=3)
             
             # Mark the angle calculation result
-            for ts, ap_id, angle in self.signal_memory_ap_angles:
-                plt.axvline(x=ts, color=['darkred','darkblue'][ap_id], linestyle='--', 
-                        label=f'AP{ap_id} Angle: {angle:.1f}°')
+            rblues = ['#008888', '#007777', '#006666', '#005555', '#004444', '#003333']
+            for (max_amp_ts, ap_id), angle, point_amp in self.signal_memory_ap_angles: 
+                if ap_id not in labelled_angle_aps:
+                    plt.scatter(max_amp_ts, point_amp, c=rblues[len(labelled_angle_aps)%len(rblues)], s=60, zorder=3,
+                                label=f'AP{ap_id} Angle = {angle:.1f}°')
+                    labelled_angle_aps.append(ap_id)
+                else: 
+                    plt.scatter(max_amp_ts, point_amp, c=rblues[len(labelled_angle_aps)%len(rblues)], s=60, zorder=3)
         
         plt.xlabel('Time (ms)')
         plt.ylabel('Amplitude')
         plt.title(f'Bee {bee_id} Received Signal')
         plt.legend()
         
-        # Save the figure
+
         os.makedirs(f'sim_figures/bee_{bee_id:02d}', exist_ok=True)
         plt.savefig(f'sim_figures/bee_{bee_id:02d}/received_signal{"_raw_" + str(self.signal_memory_debug_count) if not mark else ""}.png', 
                       dpi=200, bbox_inches='tight')
@@ -284,8 +322,8 @@ class Bee:
         # Cut the preambles and angles memory at the same time
         # Not too costly, as each sweep period => only 1 statistics saved, 
         # so just perform linear search
-        self.signal_memory_preambles = [p for p in self.signal_memory_preambles if p[0] >= first_preserved_timestamp]
-        self.signal_memory_ap_angles = [a for a in self.signal_memory_ap_angles if a[0] >= first_preserved_timestamp]
+        self.signal_memory_preambles = [p for p in self.signal_memory_preambles if p[0][0] >= first_preserved_timestamp]
+        self.signal_memory_ap_angles = [a for a in self.signal_memory_ap_angles if a[0][0] >= first_preserved_timestamp]
 
         # Search for new preambles in the new data
         # "locate preamble2 in S_(i+T) .. S_(3T) at i" indicates that preamble pairs should 
@@ -296,31 +334,33 @@ class Bee:
         preamble_search_index = len(self.signal_memory) - len(new_data)
         preamble_detection = None
         while (self.signal_memory_preambles and preamble_search_index < len(self.signal_memory) and
-               self.signal_memory[preamble_search_index][0] < self.signal_memory_preambles[-1][0] + AP_SWEEP_T): 
+               self.signal_memory[preamble_search_index][0] < self.signal_memory_preambles[-1][0][0] + AP_SWEEP_T): 
             preamble_search_index += 1
         if (preamble_search_index < len(self.signal_memory)):
             result = self.detect_preamble_signal(self.signal_memory[preamble_search_index:])
             if (result):
-                preamble_detection = result[1]
-                self.signal_memory_preambles.append(result)
-
-        # Process the signal segment after preamble
-        for ts, ap_id in self.signal_memory_preambles: 
-            start_idx = next(i for i, s in enumerate(self.signal_memory) if s[0] >= ts + AP_PREAMBLE_T)
-            end_time = ts + AP_SWEEP_T
-            signal_segment = [s for s in self.signal_memory[start_idx:] if s[0] <= end_time]
-            
-            # Calculate the optimal phase shift angle that maximizes the amplitude
-            angle = self.find_angle_from_max_amplitude(signal_segment, ap_id)
-            print  (f"\nsignal_segment: {[(i[0], np.round(i[1], 5)) for i in signal_segment]}")
-            print  (f"└─ Found angle: {angle} for AP{ap_id} at {ts:.2f}ms sweep. ")
-            if angle: 
-                self.signal_memory_ap_angles.append( (ts + AP_PREAMBLE_T, ap_id, angle) )
-
+                preamble_info, sampled_timestamp_amps, end_idx = result
+                preamble_detection = preamble_info[1]
+                self.signal_memory_preambles.append((preamble_info, sampled_timestamp_amps))
+                
+                # 精确提取相位扫描信号段
+                signal_start_idx = preamble_search_index + end_idx
+                sweep_end_time = preamble_info[0] + AP_SWEEP_T
+                signal_segment = []
+                for i in range(signal_start_idx, len(self.signal_memory)):
+                    ts, amp = self.signal_memory[i]
+                    if ts > sweep_end_time:
+                        break
+                    signal_segment.append( (ts, amp) )
+                
+                # 计算角度
+                max_amp_sample, angle, point_amp = self.find_angle_from_max_amplitude(signal_segment, preamble_detection)
+                if angle:
+                    self.signal_memory_ap_angles.append((max_amp_sample, angle, point_amp))
         # Output the signal receive information
         if (self.signal_memory_debug_count < 30 and 
             self.signal_memory_debug_count % 10 == 9 and 
-            len(timestamps) > 0):
+            len(timestamps) > 0): 
             print (f"\nBee {self.bee_id} received signal")
             print (f"├─ First timestamp: {timestamps[0]:.2f}ms")
             print (f"├─ Last timestamp: {timestamps[-1]:.2f}ms")
@@ -330,8 +370,8 @@ class Bee:
             print (f"├─ Num of deleted samples: {before_crop_len - len(self.signal_memory)}")
             print (f"├─ Num of stored samples: {len(self.signal_memory)}")
             if (preamble_detection): 
-                print (f"├─ AP detected from preamble: {preamble_detection}")
-            print (f"└─ AP angles: {np.round(np.array(self.signal_memory_ap_angles), 3)}")
+                print (f"├─ AP detected: {preamble_detection}")
+            print (f"└─ ap_id: (max_amp_ts, angle): \n{[f'{ts_and_ap_id[1]}: {round(ts_and_ap_id[0], 2)}ms, {round(angle, 2)}°' for ts_and_ap_id, angle, _ in self.signal_memory_ap_angles]}")
             self.plot_received_signal(self.bee_id, self.signal_memory, mark = True)
             self.signal_receive_plotted = True
 
@@ -864,7 +904,7 @@ class AP:
         cbar.outline.set_edgecolor('black')
 
         # Add environment markers
-        self.test_plot_environment_markers()
+        self.draw_plot_environment_markers()
         
         # 标注测试点
         for info in test_info:
@@ -894,7 +934,7 @@ class AP:
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
 
-    def test_plot_environment_markers(self):
+    def draw_plot_environment_markers(self):
         """
         Unified environment markers plot
         """
@@ -1120,7 +1160,7 @@ def plot_attenuation_map(ap_id, attenuation_grid):
     plt.setp(cbar.ax.yaxis.get_ticklines(), color='black')
 
     # Create environment markers
-    APs[ap_id].test_plot_environment_markers()
+    APs[ap_id].draw_plot_environment_markers()
 
     plt.title(f"AP {ap_id} Signal Attenuation Map")
     plt.xlabel("X (meters)")
