@@ -762,7 +762,7 @@ class AP:
         plt.savefig(os.path.join(output_dir, f"signal_charactertistics_at_location_{norm_pos[0]:.2f}_{norm_pos[1]:.2f}.png"), 
                   dpi=300, bbox_inches='tight')
         plt.close()
-    
+
     def optimal_phase_to_angle(self, 
                                optimal_theta, # in radians, unit: π
                                ):
@@ -817,8 +817,6 @@ class AP:
         max_attempts = 10
         test_points = []
         for _ in range(max_attempts): 
-
-            continue ###############
             theta = np.random.uniform(0, 2*np.pi)
             direction = np.array([np.cos(theta), np.sin(theta)])
             
@@ -829,20 +827,17 @@ class AP:
                 (1 - ap_center[1])/direction[1] if direction[1]>0 else ap_center[1]/-direction[1],
                 key=abs
             ) if not np.allclose(direction, 0) else 0
-            
             if max_step < 0.2: continue
             
             # Generate two test points (distance ≥ 0.2)
             step1 = np.random.uniform(0.1, max_step-0.1)
             step2 = step1 + 0.2 + np.random.uniform(0, 0.1)
-            if step2 > max_step:
-                continue
-            
+            if step2 > max_step: continue
             p1 = ap_center + direction * step1
             p2 = ap_center + direction * step2
             test_points = [p1, p2]
             break
-        else: 
+        else: # fallback to the default test points
             test_points = [
                 np.array([0.5, 0.25]) # 150 degrees: [0.5, 0.644]
             ]
@@ -905,8 +900,9 @@ class AP:
         blues[:, 3] = np.linspace(0.1, 0.6, 256 + 1)  # 设置透明度渐变
         cmap = ListedColormap(blues)
 
+        # 动态计算绘图范围
         img = plt.imshow(best_phases.T,  # 转置矩阵以匹配坐标方向
-                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE],
+                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE / FIELD_ASPECT_RATIO],
                   origin='lower',
                   cmap=cmap,
                   aspect='equal',
@@ -933,15 +929,21 @@ class AP:
         # 绘制天线阵列方向
         ant_dir = self.antenna_locations[1] - self.antenna_locations[0]
         ant_dir /= np.linalg.norm(ant_dir)
-        ax.arrow(ap_x, ap_y, ant_dir[0] * 0.1 * FIELD_SIZE, ant_dir[1] * 0.1 * FIELD_SIZE, 
-                head_width=2, head_length=3, fc='black', ec='black', zorder=5)
+        ax.arrow(ap_x, ap_y, ant_dir[0] * 0.05 * FIELD_SIZE, ant_dir[1] * 0.05 * FIELD_SIZE, 
+                head_width=2, head_length=3, fc='black', ec='black', zorder=5, 
+                label='Antenna direction')
+        
+        # 强制设置坐标轴范围
+        ax.set_xlim(0, FIELD_SIZE)
+        ax.set_ylim(0, FIELD_SIZE / FIELD_ASPECT_RATIO)
         
         # 绘制测试点向量和角度标注
         for test_point in test_info:
             px, py = test_point['position'] * FIELD_SIZE
             dx, dy = px - ap_x, py - ap_y
             dx, dy = dx / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE, dy / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE
-            ax.arrow(ap_x, ap_y, dx, dy, head_width=2, head_length=3, fc='black', ec='black', linestyle='--')
+            # The actual direction
+            # ax.arrow(ap_x, ap_y, dx, dy, head_width=2, head_length=3, fc='black', ec='black', linestyle='--')
             
             # 计算理论角度（考虑天线方向）
             dx_rot = dx * np.cos(self.antenna_layout_direction) + dy * np.sin(self.antenna_layout_direction)
@@ -959,6 +961,26 @@ class AP:
                     color='white', fontsize=9,
                     ha='center', va=va, 
                     bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
+            # two possible theta_cal directions
+            for i in [(1, '#ff0000'), (-1, '#bb0000')]: 
+                dx = FIELD_SIZE * 0.2 * np.cos(theta_cal * i[0] * np.pi / 180)
+                dy = FIELD_SIZE * 0.2 * np.sin(theta_cal * i[0] * np.pi / 180)
+                ax.arrow(ap_x, ap_y, dx, dy, 
+                        head_width=2, head_length=3, 
+                        fc=i[1], ec=i[1], 
+                        linestyle='--', 
+                        label=f'θ_cal = {i[0] * theta_cal:.1f}°')
+        
+        # 添加图例
+        handles, labels = ax.get_legend_handles_labels()
+        unique_labels = []
+        unique_handles = []
+        for h, l in zip(handles, labels):
+            if l not in unique_labels:
+                unique_labels.append(l)
+                unique_handles.append(h)
+        ax.legend(handles=unique_handles, labels=unique_labels, 
+                 loc='upper right', fontsize=8)
         
         plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {AP_PHASESHIFT_NUM})")
         plt.xlabel("X (meters)")
