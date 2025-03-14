@@ -13,6 +13,8 @@ if os.path.exists('sim.gif'):
     os.remove('sim.gif')
 if os.path.exists('sim_figures'):
     shutil.rmtree('sim_figures')
+if os.path.exists('sim_stats'):
+    shutil.rmtree('sim_stats')
 
 
 # Environment and Display Parameters
@@ -562,8 +564,7 @@ class AP:
                 attenuation_map[(x, y)] = float(atten)
         self.attenuation_map = attenuation_map
     
-    def sample_signal(self, t, location=None, 
-                      test = False):
+    def sample_signal(self, t, location=None):
         
         # Calculate the phase difference for each antenna
         phase_diffs = self.calculate_beamforming_phase(location) if (location is not None and len(location) > 0) else [0]*(self.antenna_num-1)
@@ -583,7 +584,7 @@ class AP:
             ]
         else:  # Beamforming scanning stage
             # Discrete phase step (consistent with test_beamforming_best_theta)
-            phase_index = int(AP_PHASESHIFT_NUM * (t - sweep_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
+            phase_index = AP_PHASESHIFT_NUM * (t - sweep_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T)
             ap_theta = 2 * np.pi * phase_index / AP_PHASESHIFT_NUM
             
             # Complex signal superposition (corrected phase difference sign)
@@ -591,6 +592,8 @@ class AP:
             for i in range(self.antenna_num - 1):
                 phase = ap_theta + phase_diffs[i]
                 complex_sum += np.exp(1j * phase)
+
+            # print  (f"complex_sum: {complex_sum}")
             
             # Amplitude calculation (normalized processing)
             amplitude = np.abs(complex_sum)
@@ -601,8 +604,216 @@ class AP:
             #             f.write(f"theta: {ap_theta} -> complex_sum: {complex_sum}, amplitude: {amplitude}\n")
             #             hive_sample_signal_last_ap_theta = ap_theta
 
+            # with debug_print_lock:
+            #     print  (f"\nt: {t}")
+            #     print  (f"ap_theta: {ap_theta}")
+            #     print  (f"amplitude: {amplitude}")
+
             return amplitude
     
+    def generate_signal(self, sweep_start, location=None):
+        '''
+        Generate a signal given the sweep start time for a sweep period for a specific location
+        '''
+        preamble_samples = 10 * len(AP_PREAMBLES[0])
+        scan_samples = 2 * AP_PHASESHIFT_NUM
+        preamble_ts = np.linspace(sweep_start, sweep_start+AP_PREAMBLE_T, preamble_samples, endpoint=False)
+        scan_ts = np.linspace(sweep_start+AP_PREAMBLE_T, sweep_start+AP_SWEEP_T, scan_samples, endpoint=False)
+        timestamps = np.concatenate([preamble_ts, scan_ts]).tolist()
+        samples = []
+        for t in timestamps: 
+            samples.append(self.sample_signal(t, location))
+        return timestamps, samples
+    
+    def transmit_signal(self, bees, timestamp):
+        '''
+        每个sweep周期生成AP_PHASESHIFT_NUM个样本
+        '''
+        # Check if the current timestamp is within the transmission window
+        if (self.signal_start is None or 
+            timestamp < self.signal_start or 
+            (timestamp - self.signal_start) % (AP_NUM * AP_SWEEP_T) >= AP_SWEEP_T):
+            return 0
+        
+        # Generate the time axis for the current sweep period
+        sweep_start = self.signal_start + ((timestamp - self.signal_start) // AP_SWEEP_T) * AP_SWEEP_T
+        
+        # Send the signal to all bees
+        for bee in bees: 
+            timestamps, raw_amps = self.generate_signal(sweep_start, bee.location_normalized)
+            # print  (f"\nbee {bee.bee_id} location: {bee.location_normalized}\nraw_amps: {[round(i, 3) for i in raw_amps]}")
+            attenuation = self.calculate_attenuation(bee.location_normalized)
+            amp_scale = 10**(-attenuation/20)
+            samples = [s * amp_scale for s in raw_amps]  # Now s is a single value
+            bee.receive_signal(timestamps, samples)
+
+    def test_signal_characteristics(self):
+        '''
+        Generate preamble and actual signal analysis with separated time scales
+        The AP time-dependent phase shift is considered in the figure
+        '''
+
+        # Find the signal period
+        period_ns = 1e9 / self.freq  # in ns
+        preamble_duration_ms = AP_PREAMBLE_T  # in ms
+        num_periods = 3
+        signal_duration_ns = (num_periods+1) * period_ns  # in ns, one more period allow phase shift part finish drawing
+        
+        # Dynamic sampling settings
+        samples_preamble = 100  # total preamble samples
+        sampling_rate = 20
+        
+        # Generate test signal data
+        preamble_t = np.linspace(self.signal_start, self.signal_start + preamble_duration_ms, samples_preamble, endpoint=False)
+        sweep_t = np.linspace(self.signal_start + preamble_duration_ms, self.signal_start + AP_SWEEP_T, sampling_rate * AP_PHASESHIFT_NUM, endpoint=False)
+        preamble_data = [self.sample_signal(t) for t in preamble_t]
+        phase_shift = [self.sample_signal(t) for t in sweep_t]
+
+        # Create dual-view layout
+        _ = plt.figure(figsize=(14, 10))
+        gs = gridspec.GridSpec(2, 1, 
+                             height_ratios=[1, 2],
+                             hspace=0.3)
+        
+        # Preamble view (stepped line chart)
+        ax1 = plt.subplot(gs[0])
+        preamble_level_1 = np.max(preamble_data).item()
+        preamble_digital = np.array(preamble_data) / preamble_level_1
+        ax1.step(preamble_t, preamble_digital, 
+                where='post', 
+                color='#FF4500',
+                linewidth=1.5)
+        ax1.set_title(f"Preamble Digital Signal ({preamble_duration_ms}ms)\n"
+                      f"(Record start t: {self.signal_start}ms)")
+        ax1.set_xlabel("Time (ms)")
+        ax1.set_ylabel("Digital Level")
+        ax1.grid(True, axis='y', linestyle=':')
+        ax1.set_xlim(self.signal_start, self.signal_start + preamble_duration_ms)
+        ax1.set_ylim(-0.1, 1.1)
+        
+        # Signal period view (ns scale)
+        ax2 = plt.subplot(gs[1])
+        relative_t = sweep_t - self.signal_start - preamble_duration_ms
+        ax2.plot(relative_t, phase_shift, 'b-', alpha=0.8)  # Apply time offset
+
+        # Create the overall chart
+        ax2.set_title(f"Phase Shift ({self.freq/1e6}MHz) (AP start t: {self.signal_start}ms)\n"
+                      f"(Record start t: {self.signal_start}ms + {preamble_duration_ms}ms (preamble) @ 0ms in the chart)")
+        ax2.set_xlabel("Time (ms)")
+        ax2.set_ylabel("Amplitude")
+        ax2.grid(True, which='both', alpha=0.4)
+        ax2.set_xlim(0, AP_SWEEP_T - preamble_duration_ms)
+        ax2.set_ylim(-0.1 * AP_NUM_ANTENNAS, 1.1 * AP_NUM_ANTENNAS)
+        output_dir = f'sim_figures/AP_{self.ap_id}'
+        os.makedirs(output_dir, exist_ok=True)
+        plt.savefig(os.path.join(output_dir, "signal_characteristics.png"), 
+                  dpi=300, bbox_inches='tight')
+        plt.close()
+        print (f"\nAccess Point {self.ap_id} Statistics:")
+        print (f"├─ Location: {[round(i.item(), 3) for i in self.location]}")
+        print (f"├─ Preamble Duration: {preamble_duration_ms}ms")
+        print (f"├─ Signal (sweep) Duration: {signal_duration_ns:.2f}ns")
+        print (f"├─ Phaseshifts per sweep: {AP_PHASESHIFT_NUM}")
+        print (f"├─ Carrier Frequency: {self.freq/1e6}MHz")
+        print (f"├─ Single Period: {period_ns:.4f}ns")
+        print (f"├─ Wavelength: {self.wavelength:.4f}m")
+        print (f"├─ Antenna Spacing: {self.antenna_spacing:.4f}m (half wavelength)")
+        print (f"├─ Antenna Layout Direction: {round(self.antenna_layout_direction, 3)}π")
+        for i in range(self.antenna_num):
+            print (f"│   {'├─' if i < self.antenna_num - 1 else '└─'} Antenna {i} Location: {[round(i.item(), 3) for i in self.antenna_locations[i]]}")
+        print (f"└─ 3 Cycles Duration: {signal_duration_ns:.2f}ns")
+
+    def test_signal_charactertistics_at_location(self, norm_pos):
+        '''
+        Verify the signal phase shift characteristics at a specific location
+        '''
+        location = np.array(norm_pos)
+        timestamps = np.arange(self.signal_start, self.signal_start + AP_SWEEP_T, 0.1)  # 0.1ms resolution
+        original = []
+        attenuated = []
+        phases = []
+
+        for t in timestamps:
+
+            # Original signal (no attenuation)
+            amp = self.sample_signal(t, location)
+            original.append(amp)
+            
+            # Actual received signal (with beamforming and attenuation)
+            # The signal outputs for every antenna are ampliied to AP_SIGNAL_AMPLITUDE
+            equivalent_signal_start = self.signal_start + AP_SWEEP_T * ((t - self.signal_start) // AP_SWEEP_T)
+            attenuation = self.calculate_attenuation(location)
+            amp_scale = 10 ** (-(AP_SIGNAL_AMPLITUDE - attenuation)/20)
+            actual_amp = self.sample_signal(t, location) * amp_scale
+            attenuated.append(actual_amp)
+            # print  (AP_SIGNAL_AMPLITUDE, attenuation, amp_scale, actual_amp)
+            
+            # Simulate the phase shift
+            phase_shift = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (t - equivalent_signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
+            phases.append(phase_shift)
+
+        # Original signal figure
+        plt.figure(figsize=(12, 8))
+        plt.subplot(3, 1, 1)
+        plt.plot(timestamps, original, label='Original Amplitude')
+        plt.title(f"AP{self.ap_id} Signal Components @ ({norm_pos[0]:.2f}, {norm_pos[1]:.2f})")
+        plt.ylabel("Amplitude (V)")
+        plt.legend()
+        
+        # Attenuated signal figure
+        plt.subplot(3, 1, 2)
+        plt.plot(timestamps, attenuated, color='orange', label='Attenuated Amplitude')
+        plt.ylabel("Amplitude (V)")
+        plt.legend()
+        
+        theta_values = []
+        for t in timestamps:
+            if t < self.signal_start + AP_PREAMBLE_T: 
+                # Preamble phase fixed theta value [the preamble line will not be displayed]
+                theta_values.append(-np.pi/2)
+            else:
+                # Calculate the theta value linear change in the scan phase
+                scan_progress = (t - self.signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T)
+                theta = -np.pi/2 + scan_progress * np.pi
+                theta_values.append(theta)
+
+        # Phase change figure
+        plt.subplot(3, 1, 3)
+        for j in range(2, self.antenna_num+1):
+            phases = [(j-1) * np.pi * np.sin(theta) for theta in theta_values]  # 以π为单位
+            # Preamble phase [the preamble line will not be displayed]
+            # preamble_mask = [t < AP_PREAMBLE_T for t in timestamps]
+            # plt.plot(np.array(timestamps)[preamble_mask], 
+            #         np.array(phases)[preamble_mask], 
+            #         color='gray', 
+            #         linewidth=1.5,
+            #         alpha=0)
+            
+            # Scan phase (Sweep phase)
+            scan_mask = [t >= self.signal_start + AP_PREAMBLE_T for t in timestamps]
+            plt.plot(np.array(timestamps)[scan_mask], 
+                    np.array(phases)[scan_mask], 
+                    linewidth=1.5,
+                    label=f'Antenna {j} Phase')
+
+        # Set y-axis ticks as multiples of π
+        max_phase = (self.antenna_num-1)
+        y_ticks = np.arange(-max_phase, max_phase+1)
+        plt.yticks(y_ticks, [f'{x}π' if x !=0 else '0' for x in y_ticks])
+        plt.xlabel("Time (ms)")
+        plt.ylabel("Phase (π rad)")
+        plt.grid(alpha=0.3)
+
+        # Add preamble region annotation
+        plt.axvspan(self.signal_start, self.signal_start + AP_PREAMBLE_T, color='gray', alpha=0.2, label='Preamble stage')
+        plt.legend()
+        plt.tight_layout()
+        output_dir = f'sim_figures/AP_{self.ap_id}'
+        os.makedirs(output_dir, exist_ok=True)
+        plt.savefig(os.path.join(output_dir, f"signal_charactertistics_at_location_{norm_pos[0]:.2f}_{norm_pos[1]:.2f}.png"), 
+                  dpi=300, bbox_inches='tight')
+        plt.close()
+
     def test_beamforming_best_theta(self):
         """
         Generate the beamforming maximum amplitude mapping to phase shifts
@@ -816,246 +1027,13 @@ class AP:
         ax.legend(handles=unique_handles, labels=unique_labels, 
                  loc='upper right', fontsize=8)
         
-        plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {AP_PHASESHIFT_NUM})")
+        plt.title(f"AP{self.ap_id} Optimal θ Map (antenna num: {self.antenna_num}, direction: {self.antenna_layout_direction}°)\n(Phase shifts per sweep: {AP_PHASESHIFT_NUM})")
         plt.xlabel("X (meters)")
         plt.ylabel("Y (meters)")
         
         # Save the figure
         save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_best_theta.png")
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
-        plt.close()
-
-    def generate_signal(self, sweep_start, location=None):
-        '''
-        Generate a signal given the sweep start time for a sweep period for a specific location
-        '''
-        preamble_samples = 10 * len(AP_PREAMBLES[0])
-        scan_samples = 2 * AP_PHASESHIFT_NUM
-        preamble_ts = np.linspace(sweep_start, sweep_start+AP_PREAMBLE_T, preamble_samples, endpoint=False)
-        scan_ts = np.linspace(sweep_start+AP_PREAMBLE_T, sweep_start+AP_SWEEP_T, scan_samples, endpoint=False)
-        timestamps = np.concatenate([preamble_ts, scan_ts]).tolist()
-        samples = []
-        for t in timestamps: 
-            samples.append(self.sample_signal(t, location, test=True))
-        return timestamps, samples
-    
-    def transmit_signal(self, bees, timestamp):
-        '''
-        每个sweep周期生成AP_PHASESHIFT_NUM个样本
-        '''
-        # Check if the current timestamp is within the transmission window
-        if (self.signal_start is None or 
-            timestamp < self.signal_start or 
-            (timestamp - self.signal_start) % (AP_NUM * AP_SWEEP_T) >= AP_SWEEP_T):
-            return 0
-        
-        # Generate the time axis for the current sweep period
-        sweep_start = self.signal_start + ((timestamp - self.signal_start) // AP_SWEEP_T) * AP_SWEEP_T
-        
-        # Send the signal to all bees
-        for bee in bees: 
-            timestamps, raw_amps = self.generate_signal(sweep_start, bee.location_normalized)
-            # print  (f"\nbee {bee.bee_id} location: {bee.location_normalized}\nraw_amps: {[round(i, 3) for i in raw_amps]}")
-            attenuation = self.calculate_attenuation(bee.location_normalized)
-            amp_scale = 10**(-attenuation/20)
-            samples = [s * amp_scale for s in raw_amps]  # Now s is a single value
-            bee.receive_signal(timestamps, samples)
-
-    def test_signal_characteristics(self, timestamp):
-        '''
-        Generate preamble and actual signal analysis with separated time scales
-        The AP time-dependent phase shift is considered in the figure
-        '''
-
-        # Find the signal period
-        period_ns = 1e9 / self.freq  # in ns
-        preamble_duration_ms = AP_PREAMBLE_T  # in ms
-        num_periods = 3
-        signal_duration_ns = (num_periods+1) * period_ns  # in ns, one more period allow phase shift part finish drawing
-        
-        # Dynamic sampling settings
-        samples_preamble = 100  # total preamble samples
-        samples_per_period = 1000  # samples per period
-        
-        # Generate test signal data
-        preamble_t = np.linspace(timestamp, timestamp + preamble_duration_ms, samples_preamble, endpoint=False)
-        signal_t = np.linspace(timestamp + preamble_duration_ms, 
-                             timestamp + preamble_duration_ms + signal_duration_ns * 1e-6,  # in ns to ms
-                             (num_periods+1) * samples_per_period, endpoint=False)
-        preamble_data = [self.sample_signal(t) for t in preamble_t]
-        signal_data = [self.sample_signal(t) for t in signal_t]
-
-        # Create dual-view layout
-        _ = plt.figure(figsize=(14, 10))
-        gs = gridspec.GridSpec(2, 1, 
-                             height_ratios=[1, 2],
-                             hspace=0.3)
-        
-        # Preamble view (stepped line chart)
-        ax1 = plt.subplot(gs[0])
-        ax1.step(preamble_t, preamble_data, 
-                where='post', 
-                color='#FF4500',
-                linewidth=1.5)
-        ax1.set_title(f"Preamble Digital Signal ({preamble_duration_ms}ms)\n"
-                      f"(Record start t: {timestamp}ms)")
-        ax1.set_xlabel("Time (ms)")
-        ax1.set_ylabel("Digital Level")
-        ax1.grid(True, axis='y', linestyle=':')
-        ax1.set_xlim(timestamp - 0.1, timestamp + preamble_duration_ms + 0.1)
-        ax1.set_ylim(-0.1, 1.1)
-        
-        # Signal period view (ns scale)
-        ax2 = plt.subplot(gs[1])
-        relative_t = (signal_t - timestamp - preamble_duration_ms) * 1e6  # in ns
-        equivalent_signal_start = self.signal_start + AP_SWEEP_T * (
-            (timestamp - self.signal_start) // AP_SWEEP_T
-        )
-        
-        # Calculate time in sweep phase (after preamble)
-        # Convert phase shift to time offset (phase_shift = 2πfΔt => Δt = phase_shift/(2πf))
-        time_in_sweep = timestamp - equivalent_signal_start - AP_PREAMBLE_T
-        phase_progress = time_in_sweep / (AP_SWEEP_T - AP_PREAMBLE_T)
-        phase_shift = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(
-            AP_PHASESHIFT_NUM * phase_progress)
-
-        time_offset_ns = (phase_shift / (2 * np.pi * self.freq)) * 1e9
-        ax2.plot(relative_t, signal_data, 'b-', alpha=0.8)  # Apply time offset
-        
-        # Draw vertical lines at correct period boundaries
-        for i in range(3):
-            t = (i+1)*period_ns - time_offset_ns
-            ax2.axvline(t, color='green', linestyle='--', alpha=0.6)
-            ax2.text(t-period_ns/2, 0.9, 
-                    f'Cycle {i+1}\n({period_ns:.2f}ns)', 
-                    ha='center', fontsize=9)
-        
-        # Add phase shift mask and legend
-        ax2.axvspan(0, -1 * time_offset_ns, 
-                   facecolor='lightblue', 
-                   alpha=0.3,
-                   label=f'Phase Shift: {phase_shift/np.pi:.2f}π = {time_offset_ns:.2f}ns')
-        ax2.legend(loc='upper right', framealpha=0.9)
-
-        # Set axis limits relative to actual signal
-        ax2.set_xlim(-period_ns*0.1, signal_duration_ns*1.1)
-
-        # Create the overall chart
-        ax2.set_title(f"Actual Signal({self.freq/1e6}MHz) (AP start t: {timestamp}ms)\n"
-                      f"(Record start t: {timestamp}ms + {preamble_duration_ms}ms (preamble) <= 0ns in the chart)")
-        ax2.set_xlabel("Time (ns)")
-        ax2.set_ylabel("Amplitude")
-        ax2.grid(True, which='both', alpha=0.4)
-        ax2.set_xlim(- period_ns * 0.1, signal_duration_ns + period_ns * 0.1 - time_offset_ns)
-        ax2.set_ylim(-1.1, 1.1)
-        output_dir = f'sim_figures/AP_{self.ap_id}'
-        os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(os.path.join(output_dir, "signal_characteristics.png"), 
-                  dpi=300, bbox_inches='tight')
-        plt.close()
-        print (f"\nAccess Point {self.ap_id} Statistics:")
-        print (f"├─ Location: {[round(i.item(), 3) for i in self.location]}")
-        print (f"├─ Preamble Duration: {preamble_duration_ms}ms")
-        print (f"├─ Signal (sweep) Duration: {signal_duration_ns:.2f}ns")
-        print (f"├─ Phaseshifts per sweep: {AP_PHASESHIFT_NUM}")
-        print (f"├─ Carrier Frequency: {self.freq/1e6}MHz")
-        print (f"├─ Single Period: {period_ns:.4f}ns")
-        print (f"├─ Wavelength: {self.wavelength:.4f}m")
-        print (f"├─ Antenna Spacing: {self.antenna_spacing:.4f}m (half wavelength)")
-        print (f"├─ Antenna Layout Direction: {round(self.antenna_layout_direction, 3)}π")
-        for i in range(self.antenna_num):
-            print (f"│   {'├─' if i < self.antenna_num - 1 else '└─'} Antenna {i} Location: {[round(i.item(), 3) for i in self.antenna_locations[i]]}")
-        print (f"└─ 3 Cycles Duration: {signal_duration_ns:.2f}ns")
-
-    def test_signal_charactertistics_at_location(self, norm_pos):
-        '''
-        Verify the signal characteristics at a specific location
-        '''
-        location = np.array(norm_pos)
-        timestamps = np.arange(self.signal_start, self.signal_start + AP_SWEEP_T, 0.1)  # 0.1ms resolution
-        original = []
-        attenuated = []
-        phases = []
-
-        for t in timestamps:
-
-            # Original signal (no attenuation)
-            amp = self.sample_signal(t, location)
-            original.append(amp)
-            
-            # Actual received signal (with beamforming and attenuation)
-            # The signal outputs for every antenna are ampliied to AP_SIGNAL_AMPLITUDE
-            equivalent_signal_start = self.signal_start + AP_SWEEP_T * ((t - self.signal_start) // AP_SWEEP_T)
-            attenuation = self.calculate_attenuation(location)
-            amp_scale = 10 ** (-(AP_SIGNAL_AMPLITUDE - attenuation)/20)
-            actual_amp = self.sample_signal(t, location) * amp_scale
-            attenuated.append(actual_amp)
-            # print  (AP_SIGNAL_AMPLITUDE, attenuation, amp_scale, actual_amp)
-            
-            # Simulate the phase shift
-            phase_shift = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (t - equivalent_signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
-            phases.append(phase_shift)
-
-        # Original signal figure
-        plt.figure(figsize=(12, 8))
-        plt.subplot(3, 1, 1)
-        plt.plot(timestamps, original, label='Original Signal')
-        plt.title(f"AP{self.ap_id} Signal Components @ ({norm_pos[0]:.2f}, {norm_pos[1]:.2f})")
-        plt.ylabel("Amplitude (V)")
-        plt.legend()
-        
-        # Attenuated signal figure
-        plt.subplot(3, 1, 2)
-        plt.plot(timestamps, attenuated, color='orange', label='Attenuated Signal')
-        plt.ylabel("Amplitude (V)")
-        plt.legend()
-        
-        theta_values = []
-        for t in timestamps:
-            if t < self.signal_start + AP_PREAMBLE_T: 
-                # Preamble phase fixed theta value [the preamble line will not be displayed]
-                theta_values.append(-np.pi/2)
-            else:
-                # Calculate the theta value linear change in the scan phase
-                scan_progress = (t - self.signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T)
-                theta = -np.pi/2 + scan_progress * np.pi
-                theta_values.append(theta)
-
-        # Phase change figure
-        plt.subplot(3, 1, 3)
-        for j in range(2, self.antenna_num+1):
-            phases = [(j-1) * np.pi * np.sin(theta) for theta in theta_values]  # 以π为单位
-            # Preamble phase [the preamble line will not be displayed]
-            # preamble_mask = [t < AP_PREAMBLE_T for t in timestamps]
-            # plt.plot(np.array(timestamps)[preamble_mask], 
-            #         np.array(phases)[preamble_mask], 
-            #         color='gray', 
-            #         linewidth=1.5,
-            #         alpha=0)
-            
-            # Scan phase (Sweep phase)
-            scan_mask = [t >= self.signal_start + AP_PREAMBLE_T for t in timestamps]
-            plt.plot(np.array(timestamps)[scan_mask], 
-                    np.array(phases)[scan_mask], 
-                    linewidth=1.5,
-                    label=f'Antenna {j} Phase')
-
-        # Set y-axis ticks as multiples of π
-        max_phase = (self.antenna_num-1)
-        y_ticks = np.arange(-max_phase, max_phase+1)
-        plt.yticks(y_ticks, [f'{x}π' if x !=0 else '0' for x in y_ticks])
-        plt.xlabel("Time (ms)")
-        plt.ylabel("Phase (π rad)")
-        plt.grid(alpha=0.3)
-
-        # Add preamble region annotation
-        plt.axvspan(self.signal_start, self.signal_start + AP_PREAMBLE_T, color='gray', alpha=0.2, label='Preamble stage')
-        plt.legend()
-        plt.tight_layout()
-        output_dir = f'sim_figures/AP_{self.ap_id}'
-        os.makedirs(output_dir, exist_ok=True)
-        plt.savefig(os.path.join(output_dir, f"signal_charactertistics_at_location_{norm_pos[0]:.2f}_{norm_pos[1]:.2f}.png"), 
-                  dpi=300, bbox_inches='tight')
         plt.close()
 
     def calculate_attenuation(self, location):
@@ -1223,6 +1201,9 @@ for i, pos in enumerate(AP_POS_NORM):
     # so that the signal generation is coherent
     new_AP.signal_start = -i * AP_SWEEP_T
     APs.append(new_AP)
+
+
+
 
 # Generate food sources
 def generate_valid_location(existing_locations, min_dist=0.05):
@@ -1403,7 +1384,7 @@ for ap in APs:
 # Run the AP tests
 for ap in APs: 
     print (f"\nTest AP{ap.ap_id} Signal Characteristics ...")
-    ap.test_signal_characteristics(ap.signal_start)
+    ap.test_signal_characteristics()
     print (f"\nTest AP{ap.ap_id} Signal Characteristics at (0,0) ...")
     ap.test_signal_charactertistics_at_location((0.0, 0.0))
     print (f"\nTest AP{ap.ap_id} Beamforming Optimal Phases ...")
