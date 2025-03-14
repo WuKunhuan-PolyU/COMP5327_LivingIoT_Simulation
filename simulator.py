@@ -16,7 +16,7 @@ if os.path.exists('sim_figures'):
 
 
 # Environment and Display Parameters
-NUM_BEES = 1
+NUM_BEES = 3
 NUM_FOOD_SOURCES = 5  # randomly distributed in the field
 HIVE_POS_NORM = (0.5, 0.1)                  # normalized
 AP_POS_NORM = [(0.4, 0.0), (0.0, 0.5)]    # normalized
@@ -46,7 +46,7 @@ AP_SIGNAL_AMPLITUDE = 10**(AP_SIGNAL_STRENGTH / 20)  # 转换dBm为线性振幅
 
 # Simulation Parameters
 FRAME_TIME = 50    # ms
-SIM_TIME = 1000     # ms
+SIM_TIME = 5000     # ms
 NUM_FRAMES = round(SIM_TIME / FRAME_TIME)
 
 # Bee Parameters
@@ -1460,10 +1460,8 @@ def save_bee_trails(current_time):
     os.makedirs('sim_stats', exist_ok=True)
 
     for i, bee in enumerate(sim.bees):
-        bee_dir = f'sim_figures/bee_{i:02d}'
-        os.makedirs(bee_dir, exist_ok=True)
-        
-        # 创建统计数据目录
+        figure_dir = f'sim_figures/bee_{i:02d}'
+        os.makedirs(figure_dir, exist_ok=True)
         stats_dir = f'sim_stats/bee_{i:02d}'
         os.makedirs(stats_dir, exist_ok=True)
             
@@ -1518,16 +1516,18 @@ def save_bee_trails(current_time):
             plt.Line2D([0], [0], marker='o', color='none', markerfacecolor='yellow', 
                     markersize=8, label='Actual Path'),
             plt.Line2D([0], [0], marker='o', color='none', markerfacecolor='cyan',
-                    markersize=8, label='Estimated')
+                    markersize=8, label='Estimated'),
+            plt.Line2D([0], [0], marker='^', color='none', markerfacecolor='red', 
+                    markersize=8, alpha=0.7, label='AP'), 
         ]
         ax_bee.legend(handles=legend_elements, loc='lower left', fontsize=7)
         
         global prev_save_time
-        plt.savefig(f'{bee_dir}/trail_{prev_save_time}ms-{current_time}ms.png', dpi=150, bbox_inches='tight')
+        plt.savefig(f'{figure_dir}/bee_{i:02d}_trail_{prev_save_time}ms-{current_time}ms.png', dpi=150, bbox_inches='tight')
         plt.close(fig_bee)
 
         # 保存CSV数据
-        csv_path = f'{stats_dir}/trail_{prev_save_time}ms-{current_time}ms.csv'
+        csv_path = f'{stats_dir}/bee_{i:02d}_trail_{prev_save_time}ms-{current_time}ms.csv'
         with open(csv_path, 'w') as f:
             # 写入表头
             header = ['timestamp', 'actual_x', 'actual_y', 'estimated_x', 'estimated_y']
@@ -1546,13 +1546,10 @@ def save_bee_trails(current_time):
             all_ts.update(actual_data.keys())
             all_ts.update(est_data.keys())
             sorted_ts = sorted(all_ts)
-            # print  (f"\nangle_data: {angle_data}")
-            # print  (f"\nsorted_ts: {sorted_ts}")
             for ts in sorted_ts: 
                 actual = actual_data.get(ts, (None, None))
                 estimated = est_data.get(ts, (None, None))
                 angle = angle_data.get(ts, {})
-                # print  (f"ts = {round(ts, 2)}, angle: {angle}")
                 row = [
                     f'{ts}',
                     f"{actual[0]:.4f}" if actual[0] is not None else '',
@@ -1587,8 +1584,9 @@ def save_bee_trails(current_time):
                     ap_pos = AP_POS_NORM[ap_id]
                     dx = pos[0] - ap_pos[0]
                     dy = pos[1] - ap_pos[1]
-                    actual_angle = np.arctan2(dy, dx) % np.pi  # 0-π范围
-                    actual_angles.append(np.degrees(actual_angle))
+                    world_angle = np.arctan2(dy, dx) % np.pi  # 0-π范围
+                    antenna_angle = AP_ANTENNA_LAYOUT_DIRECTION[ap_id]  # 0-π范围
+                    actual_angles.append((np.degrees(world_angle - antenna_angle) + 360) % 180) # consider the antenna layout direction
                     actual_timestamps.append(ts)
             
             # 绘制角度对比图
