@@ -1,3 +1,3 @@
 numpy>=1.21.0
 matplotlib>=3.5.0
-pillow>=9.0.0  # 用于保存GIF
+pillow>=9.0.0
