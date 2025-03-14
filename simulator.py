@@ -16,7 +16,7 @@ if os.path.exists('sim_figures'):
 
 
 # Environment and Display Parameters
-NUM_BEES = 2
+NUM_BEES = 1
 NUM_FOOD_SOURCES = 5  # randomly distributed in the field
 HIVE_POS_NORM = (0.5, 0.1)                  # normalized
 AP_POS_NORM = [(0.4, 0.0), (0.0, 0.5)]    # normalized
@@ -46,7 +46,7 @@ AP_SIGNAL_AMPLITUDE = 10**(AP_SIGNAL_STRENGTH / 20)  # 转换dBm为线性振幅
 
 # Simulation Parameters
 FRAME_TIME = 50    # ms
-SIM_TIME = 300     # ms
+SIM_TIME = 1000     # ms
 NUM_FRAMES = round(SIM_TIME / FRAME_TIME)
 
 # Bee Parameters
@@ -118,9 +118,8 @@ class Bee:
         self.food_sources = food_sources
         self.has_food = False
         self.known_empty_sources = set() # Local memory of empty food sources
-        self.history_location = []  # Record location and time
-        self.history_location_est = [] # Record estimated location and time
-        self.ap_angles_est = {} # Record estimated AP angles. Format: {ap_id: angle, ...}
+        self.history_location = []  # Record location and time. Format: [(location, timestamp), ...]
+        self.history_location_norm_est = [] # Record estimated location and time. Format: [(location, timestamp), ...]
         self.ap_angles_update_exp_smooth = 0.8
         self.signal_memory = [] # Record the signal memory. Format: [(timestamp, amplitude), ...]
         self.signal_memory_preambles = [] # Record preamble signal's timestamp. Format: [((start_timestamp, ap_id), sampled_timestamp_amps), ...]
@@ -133,18 +132,14 @@ class Bee:
 
         # 前导码参数预计算
         self.bit_duration = AP_PREAMBLE_T / len(AP_PREAMBLES[0])  # 每个比特持续时间
-        self.preamble_states = {
-            'idle': 0,
-            'detecting': 1,
-            'verifying': 2
-        }
-        self.current_preamble_state = self.preamble_states['idle']
         self.detected_bits = []
         self.detection_start_time = None
 
+        # History stats
+        self.history_ap_angles_est = {}  # key: ap_id, value: [(angle, timestamp), ...]
+
         # Quick-access variables
         self.sweep_interval = AP_SWEEP_T * AP_NUM
-        self.intersection_cache = {}  # 缓存最近的交点计算结果
 
     def reset_knowledge(self):
         self.known_empty_sources.clear()
@@ -223,15 +218,11 @@ class Bee:
         max_idx = np.argmax([s[1] for s in signal_segment])
         max_time = signal_segment[max_idx][0]
         percentage = (max_time - signal_segment[0][0]) / (AP_SWEEP_T - AP_PREAMBLE_T)
-        
-        # 转换为归一化相位（0-2π）
-        best_theta = (max_idx / AP_PHASESHIFT_NUM) * 2
-        
-        # 使用新函数计算角度（转换为π单位）
-        angle = best_theta_to_target_angle(best_theta / np.pi) 
-        print  (f"\nsamples ({len(signal_segment)}): {[(round(i[0], 2), round(i[1], 5)) for i in signal_segment]}")
-        print  (f"max_idx: {max_idx}, time diff: {max_time - signal_segment[0][0]}, percentage: {percentage}")
-        print  (f"best_theta: {best_theta}, angle: {angle}")
+        best_theta = percentage * 2
+        angle = best_theta_to_target_angle(best_theta) 
+        # print  (f"\nsamples ({len(signal_segment)}): {[(round(i[0], 2), round(i[1], 5)) for i in signal_segment]}")
+        # print  (f"max_idx: {max_idx}, time diff: {max_time - signal_segment[0][0]}, percentage: {percentage}")
+        # print  (f"best_theta: {best_theta}, angle: {angle}")
         return (max_time, ap_id), angle, signal_segment[max_idx][1]
 
     def plot_received_signal(self, bee_id, signal_data, mark=False):
@@ -271,7 +262,7 @@ class Bee:
                                 c='red', s=30, zorder=3)
             
             # Mark the angle calculation result
-            rblues = ['#008888', '#007777', '#006666', '#005555', '#004444', '#003333']
+            rblues = ['#003333', '#006666', '#009999', '#00CCCC']
             for (max_amp_ts, ap_id), angle, point_amp in self.signal_memory_ap_angles: 
                 if ap_id not in labelled_angle_aps:
                     plt.scatter(max_amp_ts, point_amp, c=rblues[len(labelled_angle_aps)%len(rblues)], s=60, zorder=3,
@@ -318,10 +309,6 @@ class Bee:
 
         self.signal_memory.extend(new_data)
         before_crop_len = len(self.signal_memory)
-
-
-
-        # 处理信号内存裁剪
         preserve_duration = (AP_NUM + 1) * AP_SWEEP_T
         first_preserved_timestamp = self.signal_memory[-1][0] - preserve_duration if self.signal_memory else None
         
@@ -382,11 +369,22 @@ class Bee:
                         break
                     signal_segment.append( (ts, amp) )
                 
-                # 计算角度
+                # Calculate the angle
                 max_amp_sample, angle, point_amp = self.find_angle_from_max_amplitude(signal_segment, preamble_detection)
-                print (f"ap_id: {preamble_detection}, max_amp_sample: {max_amp_sample}, angle: {round(angle, 2)}, point_amp: {round(point_amp, 5)}")
                 self.signal_memory_ap_angles.append((max_amp_sample, angle, point_amp))
-                angle_detection = angle
+
+                # Save the angle estimation
+                if (preamble_detection not in self.history_ap_angles_est):
+                    self.history_ap_angles_est[preamble_detection] = [(angle, preamble_info[0])]
+                else: 
+                    last_angle = self.history_ap_angles_est[preamble_detection][-1][0]
+                    self.history_ap_angles_est[preamble_detection].append((self.ap_angles_update_exp_smooth * last_angle + (1 - self.ap_angles_update_exp_smooth) * angle, preamble_info[0]))
+                angle_detection = self.history_ap_angles_est[preamble_detection][-1][0]
+
+                # Estimate the location
+                location_est = self.get_estimated_location(preamble_info[0])
+                if (location_est):
+                    self.history_location_norm_est.append((location_est, preamble_info[0]))
 
         # Output the signal receive information
         if (self.signal_memory_debug_count > AP_NUM+1 and 
@@ -401,121 +399,104 @@ class Bee:
             print (f"├─ Num of deleted samples: {before_crop_len - len(self.signal_memory)}")
             print (f"├─ Num of stored samples: {len(self.signal_memory)}")
             if (preamble_detection): 
+                print (f"├─ AP detected: {preamble_detection}")
                 if (angle_detection):
-                    print (f"├─ AP detected: {preamble_detection}")
-                    print (f"   └─ Angle detected: {round(angle_detection, 2)}°")
-                else:
-                    print (f"├─ AP detected: {preamble_detection}")
-            print (f"└─ ap_id: (max_amp_ts, angle): \n{[f'{ts_and_ap_id[1]}: {round(ts_and_ap_id[0], 2)}ms, {round(angle, 2)}°' for ts_and_ap_id, angle, _ in self.signal_memory_ap_angles]}")
-            if (len(self.ap_angles_est.keys()) > 0):
-                print (f"└─ AP angle est.: \n{[f'{ap_id}: {round(angle, 2)}°' for ap_id, angle in self.ap_angles_est.items()]}")
+                    print (f"│  └─ Angle detected: {round(angle_detection, 2)}°")
+            print (f"└─ ap_id: (max_amp_ts, angle): \n  │ {[f'{ts_and_ap_id[1]}: {round(ts_and_ap_id[0], 2)}ms, {round(angle, 2)}°' for ts_and_ap_id, angle, _ in self.signal_memory_ap_angles]}")
+            # print  (f"self.history_location_norm_est: {self.history_location_norm_est}")
+            if (len(self.history_ap_angles_est.keys()) > 0): 
+                character = '└─'
+                if (len(self.history_location_norm_est) > 0):
+                    character = '├─'
+                print (f"  {character} AP angle est.: \n  │ {[f'{ap_id}: {round(angle_and_ts[-1][0], 2)}°, {round(angle_and_ts[-1][1], 2)}ms' for ap_id, angle_and_ts in self.history_ap_angles_est.items()]}")
+
+                if (len(self.history_location_norm_est) > 0):
+                    print (f"  └─ AP location est.: \n    {[f'{ts}: {round(location[0], 2)}, {round(location[1], 2)}' for location, ts in self.history_location_norm_est]}")
             self.plot_received_signal(self.bee_id, self.signal_memory, mark = True)
             self.signal_receive_plotted = True
 
     def get_estimated_location(self, timestamp):
-        valid_aps = [ap_id for ap_id in self.ap_angles_est if ap_id < len(APs)]
-        if len(valid_aps) < 2:
-            return None
 
-        # 获取AP位置和方向信息
+        # At least 2 APs are needed to estimate the location
+        valid_aps = [ap_id for ap_id in self.history_ap_angles_est if ap_id < len(APs)]
+        if len(valid_aps) < 2: return None
+        location_estimated = self.signal_memory_debug_count > AP_NUM+1 and self.signal_memory_debug_count <= 2*AP_NUM+1
+
+        # Only consider the direction with positive angle
         ap_data = []
         for ap_id in valid_aps:
-            ap = APs[ap_id]
-            origin = (ap.location[0], ap.location[1])
-            ant_dir = ap.antenna_layout_direction
-            measured_angle = np.radians(self.ap_angles_est[ap_id])
-            
-            # 计算两个可能的方向（±θ）
-            angles = [
-                ant_dir + measured_angle,
-                ant_dir - measured_angle
-            ]
-            ap_data.append( (origin, angles) )
+            ap = AP_POS_NORM[ap_id]
+            ant_dir = AP_ANTENNA_LAYOUT_DIRECTION[ap_id]
+            # print  (f"self.history_ap_angles_est: {self.history_ap_angles_est}")
+            measured_angle = np.radians(self.history_ap_angles_est[ap_id][-1][0].item())
+            angle = ant_dir + measured_angle
+            # print  (f"AP {ap_id}: {ap}, antenna direction: {ant_dir}, measured_angle: {measured_angle} => angle: {angle}")
+            ap_data.append( (ap, angle) )
 
-        # 计算所有可能的交点
+        if (location_estimated): 
+            print  (f"Bee {self.bee_id} estimate location: ")
+            for ap_loc, angle in ap_data:
+                print  (f"├─ AP location: {[round(ap_loc[0], 3), round(ap_loc[1], 3)]}, angle: {round(angle, 3)}π")
+
+
+        # Calculate all possible intersections
         intersections = []
         for i in range(len(ap_data)):
             for j in range(i+1, len(ap_data)):
-                (p1, angles1), (p2, angles2) = ap_data[i], ap_data[j]
-                for theta1 in angles1:
-                    for theta2 in angles2:
-                        intersect = self.calculate_intersection(p1, theta1, p2, theta2)
-                        if intersect and self.is_within_field(intersect):
-                            intersections.append(intersect)
+                (p1, angle1), (p2, angle2) = ap_data[i], ap_data[j]
+                intersect = self.calculate_intersection(p1, angle1, p2, angle2)
+                if intersect and self.is_within_field(intersect): 
+                    if (location_estimated):
+                        print (f"├─ AP {ap_data[i][0]} and AP {ap_data[j][0]} intersect at {[round(intersect[0].item(), 3), round(intersect[1].item(), 3)]}")
+                    intersections.append(intersect)
         
-        if not intersections:
+        if not intersections: 
+            if (location_estimated):
+                print (f"└─ No valid intersection found")
             return None
         
-        # 使用缓存优化：当新交点与旧交点接近时取平均
         avg_point = np.mean(intersections, axis=0)
-        if timestamp in self.intersection_cache:
-            prev_avg = self.intersection_cache[timestamp]
-            avg_point = 0.7 * avg_point + 0.3 * prev_avg
-        self.intersection_cache[timestamp] = avg_point
-        
-        return (avg_point[0]/FIELD_SIZE, avg_point[1]/(FIELD_SIZE/FIELD_ASPECT_RATIO))  # 归一化坐标
+        # print  (f"intersections: {intersections}, avg_point: {avg_point}")
+        point_norm = (avg_point[0]/FIELD_SIZE, avg_point[1]/(FIELD_SIZE/FIELD_ASPECT_RATIO))
+        if (location_estimated):
+            print (f"└─ Bee {self.bee_id} estimated location: {[round(i.item(), 3) for i in point_norm]} (normalized)")
+        return point_norm
 
     def calculate_intersection(self, p1, theta1, p2, theta2):
-        """
-        计算两个AP射线在场地内的有效交点
-        参数：
-            p1 - AP1的物理坐标 (x,y) 单位：米
-            theta1 - AP1的测量角度（已考虑天线方向）单位：弧度
-            p2 - AP2的物理坐标 (x,y) 单位：米
-            theta2 - AP2的测量角度（已考虑天线方向）单位：弧度
+        # 转换AP位置到物理坐标
+        p1_phy = (p1[0] * FIELD_SIZE, p1[1] * (FIELD_SIZE / FIELD_ASPECT_RATIO))
+        p2_phy = (p2[0] * FIELD_SIZE, p2[1] * (FIELD_SIZE / FIELD_ASPECT_RATIO))
         
-        通过AP布局设计保证：
-        1. 所有AP位于场地边缘（x=0/FIELD_SIZE 或 y=0/FIELD_SIZE）
-        2. 天线方向朝向场地中心
-        3. 有效角度范围θ ∈ (0, π/2)
-        因此只需考虑t≥0的正向射线交点
-        """
-        # 射线参数方程：
-        # AP1: x = p1.x + t1*cosθ1
-        #      y = p1.y + t1*sinθ1
-        # AP2: x = p2.x + t2*cosθ2
-        #      y = p2.y + t2*sinθ2
-        
-        # 构建线性方程组 A * [t1, t2]^T = b
+        # 构建射线方程
         A = np.array([
             [np.cos(theta1), -np.cos(theta2)],  # x方向方程系数
             [np.sin(theta1), -np.sin(theta2)]   # y方向方程系数
         ])
-        b = np.array([p2[0] - p1[0], p2[1] - p1[1]])  # 坐标差向量
-        
+        b = np.array([p2_phy[0] - p1_phy[0], p2_phy[1] - p1_phy[1]])
         try:
-            # 解线性方程组得到t1, t2
             t = np.linalg.solve(A, b)
             t1, t2 = t[0], t[1]
-            
-            # 有效性检查（确保交点在射线正前方）
             if t1 >= 0 and t2 >= 0:
-                # 计算实际交点坐标
-                intersect_x = p1[0] + t1 * np.cos(theta1)
-                intersect_y = p1[1] + t1 * np.sin(theta1)
-                
-                # 转换为正则坐标（归一化到0-1范围）
+                intersect_x = p1_phy[0] + t1 * np.cos(theta1)
+                intersect_y = p1_phy[1] + t1 * np.sin(theta1)
                 norm_x = intersect_x / FIELD_SIZE
                 norm_y = intersect_y / (FIELD_SIZE / FIELD_ASPECT_RATIO)
-                
-                # 由于AP布局设计，有效交点应满足：
-                # 0.1 < norm_x < 0.9 且 0.1 < norm_y < 0.9
-                # 避免在场地边缘出现多解
-                if 0.1 <= norm_x <= 0.9 and 0.1 <= norm_y <= 0.9:
+                if 0.01 <= norm_x <= 0.99 and 0.01 <= norm_y <= 0.99:
                     return (intersect_x, intersect_y)
-        except np.linalg.LinAlgError:
-            # 矩阵奇异，说明射线平行或重合
-            pass
+        except np.linalg.LinAlgError: pass
         return None
 
     def is_within_field(self, point):
-        """检查物理坐标点是否在场地范围内"""
+        """Check if the physical coordinates point is within the field"""
         x, y = point
-        # 场地实际尺寸：
-        # 宽度：FIELD_SIZE（默认100米）
-        # 高度：FIELD_SIZE / FIELD_ASPECT_RATIO（默认100米）
         return (0 <= x <= FIELD_SIZE) and (0 <= y <= FIELD_SIZE / FIELD_ASPECT_RATIO)
 
+
+
+# hive_sample_signal_phase_diff_sampled = False
+# hive_sample_signal_last_ap_theta = -1
+# hive_test_beamforming_best_theta_phase_diff_sampled = False
+# hive_test_beamforming_best_theta_last_theta = -1
 class AP:
     def __init__(self, ap_id, 
                  location, # (x (in m), y (in m))
@@ -537,7 +518,7 @@ class AP:
         self.antenna_layout_direction = antenna_layout_direction
         self.wavelength = 3e8 / frequency  # Speed of light / frequency, in meters
         
-        # CRITICAL: 天线布局方向向量
+        # CRITICAL: Antenna layout direction vector
         # According to the paper, say there are 2 antennas, 
         # When the first antenna has a higher distance to the target, namely Φ, 
         # There will be a relationship: arccos(Φ / d) = θ, and θ is within [0, π/2]
@@ -548,9 +529,9 @@ class AP:
             for i in range(self.antenna_num)
         ]
 
-        # 波束成形相关参数  
+        # Beamforming related parameters
         self.phase_step = np.pi / AP_PHASESHIFT_NUM  # δ = π/90 ≈ 2°
-        self.antenna_phases = [0.0] * (self.antenna_num + 1)  # 天线编号从1开始
+        self.antenna_phases = [0.0] * (self.antenna_num + 1)  # Antenna编号从1开始
 
         self.test_transmit_time = 0 # testing purpose
         self.test_transmit_count = 0 # testing purpose
@@ -581,55 +562,281 @@ class AP:
                 attenuation_map[(x, y)] = float(atten)
         self.attenuation_map = attenuation_map
     
-    def sample_signal(self, timestamp, location=None): 
-        '''
-        Generate a signal with beamforming effect given the timestamp
-        Signal comlocation: Global phase offset + beamforming phase difference
-                 ┌───────────────┐
-        Time ──→ │ Phase shifter │──→ Actual signal
-                 └─────┬─────┬───┘
-                    Global  Beamforming phase
-                    shift   difference
-        '''
-        # signal generation not started yet, OR
-        # the current time is not designed for this AP to transmit
-        if (self.signal_start is None or timestamp < self.signal_start or 
-            (timestamp - self.signal_start) % (AP_NUM * AP_SWEEP_T) >= AP_SWEEP_T): 
-            return 0
+    def sample_signal(self, t, location=None, 
+                      test = False):
         
-        # Global phase offset (due to TDMA scheduling)
-        # Calculate the beamformed phase shift <- all the antennas
-        # This only applies when the location is given
-        beam_phases = [0 for _ in range(self.antenna_num)]
-        if location is not None: 
-            # Find Φ for each antenna
-            beam_phases = self.calculate_beamforming_phase(location)
-        equivalent_signal_start = self.signal_start + AP_SWEEP_T * ((timestamp - self.signal_start) // AP_SWEEP_T)
-        if (timestamp < equivalent_signal_start + AP_PREAMBLE_T): 
-            # Preamble phase
-            return self.preamble[int((timestamp - equivalent_signal_start) / AP_PREAMBLE_T * len(self.preamble))]
-        else: 
-            # Scan phase (Sweep phase)
-            # normalize the signal amplitude from all antennas
-            # phase_shift_by_AP is the θ component in y(t) = |ax(t) + ae^(j(ϕ−θ)) * x(t)|
-            sweep_timestamp = timestamp - equivalent_signal_start - AP_PREAMBLE_T
-            phase_shift_by_AP = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (sweep_timestamp - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
-            return sum([np.sin(2 * np.pi * self.freq * (sweep_timestamp * 1e-3) + phase_shift_by_AP + phase) for phase in beam_phases]) / len(beam_phases)
+        # Calculate the phase difference for each antenna
+        phase_diffs = self.calculate_beamforming_phase(location) if (location is not None and len(location) > 0) else [0]*(self.antenna_num-1)
+        # global hive_sample_signal_phase_diff_sampled, hive_sample_signal_last_ap_theta
+        # if (not hive_sample_signal_phase_diff_sampled and self.ap_id == 0 and test): 
+        #     with open(f"hive pd - sample_signal - 1.txt", "w") as f:
+        #         f.write(f"norm_pos: {location}\n")
+        #         for k in range(self.antenna_num - 1):
+        #             f.write(f"antenna {k}'s phase diff: {phase_diffs[k]}\n")
+        #     hive_sample_signal_phase_diff_sampled = True
+        
+        # Calculate the position in the sweep cycle
+        sweep_start = self.signal_start + ((t - self.signal_start) // AP_SWEEP_T) * AP_SWEEP_T
+        if t < sweep_start + AP_PREAMBLE_T:  # Preamble stage
+            return AP_SIGNAL_AMPLITUDE * AP_PREAMBLES[self.ap_id][
+                int((t - sweep_start) / AP_PREAMBLE_T * len(AP_PREAMBLES[self.ap_id]))
+            ]
+        else:  # Beamforming scanning stage
+            # Discrete phase step (consistent with test_beamforming_best_theta)
+            phase_index = int(AP_PHASESHIFT_NUM * (t - sweep_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
+            ap_theta = 2 * np.pi * phase_index / AP_PHASESHIFT_NUM
+            
+            # Complex signal superposition (corrected phase difference sign)
+            complex_sum = 1.0
+            for i in range(self.antenna_num - 1):
+                phase = ap_theta + phase_diffs[i]
+                complex_sum += np.exp(1j * phase)
+            
+            # Amplitude calculation (normalized processing)
+            amplitude = np.abs(complex_sum)
+            # global hive_sample_signal_last_ap_theta
+            # if (self.ap_id == 0 and test): 
+            #     if (ap_theta > hive_sample_signal_last_ap_theta):
+            #         with open(f"hive pd - sample_signal - 2.txt", "a") as f:
+            #             f.write(f"theta: {ap_theta} -> complex_sum: {complex_sum}, amplitude: {amplitude}\n")
+            #             hive_sample_signal_last_ap_theta = ap_theta
+
+            return amplitude
+    
+    def test_beamforming_best_theta(self):
+        """
+        Generate the beamforming maximum amplitude mapping to phase shifts
+        """
+        # Create the test grid
+        grid_size = 201 # handle the edge case
+        x = np.linspace(0, FIELD_SIZE, grid_size, endpoint=True)
+        y = np.linspace(0, FIELD_SIZE/FIELD_ASPECT_RATIO, grid_size, endpoint=True)
+        max_amplitudes = np.zeros((grid_size, grid_size))
+        best_phases = np.zeros((grid_size, grid_size))
+        
+        # global hive_test_beamforming_best_theta_phase_diff_sampled
+        # global hive_test_beamforming_best_theta_last_theta
+        # test_i = None; test_j = None
+
+        phase_diffs = np.zeros((grid_size, grid_size, self.antenna_num-1))
+        for i in range(grid_size):
+            for j in range(grid_size):
+                norm_pos = np.array([x[i]/FIELD_SIZE, y[j]/FIELD_SIZE])
+                phase_diffs[i,j] = self.calculate_beamforming_phase(norm_pos)
+                # if (norm_pos[0].item() == 0.5 and norm_pos[1].item() == 0.1 and self.ap_id == 0 and 
+                #     not hive_test_beamforming_best_theta_phase_diff_sampled): 
+                #     test_i = i; test_j = j
+                #     with open(f"hive pd - test_beamforming_best_theta - 1.txt", "w") as f:
+                #         f.write(f"norm_pos: {norm_pos}\n")
+                #         for k in range(self.antenna_num - 1):
+                #             f.write(f"antenna {k}'s phase diff: {phase_diffs[i,j,k]}\n")
+                #     hive_test_beamforming_best_theta_phase_diff_sampled = True
+
+        # Signal superposition calculation: Iterate the theta range (0 to 2π)
+        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM, endpoint=False)
+        for theta in theta_values: 
+            complex_sum = np.ones((grid_size, grid_size), dtype=complex)  # 参考天线贡献
+            for k in range(self.antenna_num - 1):
+                phase = theta + phase_diffs[:,:,k]  # Find the phase for each antenna, for every first 2 dimensions
+                complex_sum += np.exp(1j * phase)   # Complex signal superposition
+            amplitudes = np.abs(complex_sum)  # Calculate the amplitude
+
+            # if (self.ap_id == 0 and theta > hive_test_beamforming_best_theta_last_theta):
+            #     with open(f"hive pd - test_beamforming_best_theta - 2.txt", "a") as f:
+            #         f.write(f"theta: {theta} -> complex_sum : {complex_sum[test_i, test_j]}, amplitude: {amplitudes[test_i, test_j]}\n")
+            #     hive_test_beamforming_best_theta_last_theta = theta
+            
+            # 更新最大值
+            mask = amplitudes > max_amplitudes
+            max_amplitudes[mask] = amplitudes[mask]
+            best_phases[mask] = theta % (2*np.pi)  # 相位归一化
+
+        # Dynamic test point generation
+        max_attempts = 10
+        test_points = []
+        for _ in range(max_attempts): 
+            continue # test the bee hive location
+            theta = np.random.uniform(0, 2*np.pi)
+            direction = np.array([np.cos(theta), np.sin(theta)])
+            
+            # Calculate AP center location (normalized)
+            ap_center = self.location / FIELD_SIZE
+            max_step = min(
+                (1 - ap_center[0])/direction[0] if direction[0]>0 else ap_center[0]/-direction[0],
+                (1 - ap_center[1])/direction[1] if direction[1]>0 else ap_center[1]/-direction[1],
+                key=abs
+            ) if not np.allclose(direction, 0) else 0
+            if max_step < 0.2: continue
+            
+            # Generate two test points (distance ≥ 0.2)
+            step1 = np.random.uniform(0.1, max_step-0.1)
+            step2 = step1 + 0.2 + np.random.uniform(0, 0.1)
+            if step2 > max_step: continue
+            p1 = ap_center + direction * step1
+            p2 = ap_center + direction * step2
+            test_points = [p1, p2]
+            break
+        else: # fallback to the default test points
+            test_points = [
+                # bee hive: [0.5, 0.1]
+                # 150 degrees: [0.5, 0.644]
+                np.array(HIVE_POS_NORM) 
+            ]
+            # test_points = [
+            #     np.array([self.location_normalized[0] + 0.1, self.location_normalized[1]]),
+            #     np.array([self.location_normalized[0] + 0.2, self.location_normalized[1]])
+            # ]
+
+        # 存储测试点信息
+        test_info = []
+        for point_idx, norm_pos in enumerate(test_points):
+            print(f"\nTestpoint {point_idx+1} optimal phase calculation:")
+            print(f"├─ Normalized coordinates: ({norm_pos[0]:.3f}, {norm_pos[1]:.3f})")
+            pos_m = norm_pos * FIELD_SIZE
+            print(f"├─ Actual coordinates: ({pos_m[0]:.1f}m, {pos_m[1]:.1f}m)")
+            
+            # Calculate the distance to each antenna
+            print("├─ Antenna distance to test point:")
+            for i, ant_loc in enumerate(self.antenna_locations):
+                dist = np.linalg.norm(pos_m - ant_loc)
+                print(f"│   {'→' if i==0 else ' '} Antenna {i}: {dist:.2f}m" + 
+                     f"{' (referenced distance)' if i==0 else ''}")
+            
+            # Calculate the phase differences
+            # Calculate the optimal θ and signal amplitude
+            phase_diffs = self.calculate_beamforming_phase(norm_pos)
+            max_amp, best_theta = beamforming_phases_to_best_theta(phase_diffs)
+            print(f"├─ Antenna phase differences: {[round((pd/np.pi).item(), 3) for pd in phase_diffs]}π")
+            
+            # Calculate the attenuation
+            atten = self.calculate_attenuation(norm_pos)
+            print(f"└─ Optimal θ: {best_theta/np.pi:.3f}π")
+            print(f"   ├─ Maximum amplitude: {max_amp:.3f}")
+            print(f"   └─ Total attenuation: {atten:.2f}dB")
+            
+            # 存储计算结果
+            test_info.append({
+                'location': norm_pos,
+                'phase_diffs': [round(float(pd/np.pi),3) for pd in phase_diffs],  # 转换为原生float
+                'best_theta': round(float(best_theta/np.pi),3),
+                'max_amp': round(float(max_amp),3), 
+                'atten': round(float(atten),2)
+            })
+
+        # 绘制热力图
+        plt.figure(figsize=(12, 10))
+        
+        # 创建自定义颜色映射（包含alpha通道）
+        blues = plt.cm.Blues(np.linspace(0.1, 0.9, 256 + 1))  # 调整颜色范围
+        blues[:, 3] = np.linspace(0.1, 0.6, 256 + 1)  # 设置透明度渐变
+        cmap = ListedColormap(blues)
+
+        # 动态计算绘图范围
+        img = plt.imshow(best_phases.T,  # 转置矩阵以匹配坐标方向
+                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE / FIELD_ASPECT_RATIO],
+                  origin='lower',
+                  cmap=cmap,
+                  aspect='equal',
+                  vmin=0, 
+                  vmax=2*np.pi,
+                  interpolation='bilinear')
+        
+        # Configure the color bar
+        cbar = plt.colorbar(img, 
+                           label='Optimal Phase Shift θ (rad)',
+                           ticks=np.linspace(0, 2*np.pi, 5, endpoint=True),
+                           extend='both')
+        cbar.set_ticklabels(['0', 'π/2', 'π', '3π/2', '2π'])
+        cbar.outline.set_edgecolor('black')
+
+        # Add environment markers
+        self.draw_plot_environment_markers()
+        
+        # 添加天线方向箭头和角度标注
+        ax = plt.gca()
+        ap_x, ap_y = self.location
+        ax.plot(ap_x, ap_y, 'r^', markersize=15, zorder=5)
+        
+        # 绘制天线阵列方向
+        ant_dir = self.antenna_locations[1] - self.antenna_locations[0]
+        ant_dir /= np.linalg.norm(ant_dir)
+        ax.arrow(ap_x, ap_y, ant_dir[0] * 0.05 * FIELD_SIZE, ant_dir[1] * 0.05 * FIELD_SIZE, 
+                head_width=2, head_length=3, fc='black', ec='black', zorder=5, 
+                label='Antenna direction')
+        
+        # 强制设置坐标轴范围
+        ax.set_xlim(0, FIELD_SIZE)
+        ax.set_ylim(0, FIELD_SIZE / FIELD_ASPECT_RATIO)
+        
+        # 绘制测试点向量和角度标注
+        for i, test_point in enumerate(test_info):
+            px, py = test_point['location'] * FIELD_SIZE
+            dx, dy = px - ap_x, py - ap_y
+            dx, dy = dx / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE, dy / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE
+            # The actual direction
+            # ax.arrow(ap_x, ap_y, dx, dy, head_width=2, head_length=3, fc='black', ec='black', linestyle='--')
+            
+            # 计算理论角度（考虑天线方向）
+            dx_rot = dx * np.cos(self.antenna_layout_direction) + dy * np.sin(self.antenna_layout_direction)
+            dy_rot = -dx * np.sin(self.antenna_layout_direction) + dy * np.cos(self.antenna_layout_direction)
+            theta_geo = np.degrees(np.arctan2(dy_rot, dx_rot))
+            theta_cal = best_theta_to_target_angle(test_point['best_theta'])
+
+            # 绘制点
+            x = test_point['location'][0] * FIELD_SIZE
+            y = test_point['location'][1] * FIELD_SIZE
+            if i == 0:
+                plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4, label=f'Test Points')
+            else:
+                plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4)
+            va = 'bottom' if y < FIELD_SIZE*0.8 else 'top'
+            plt.text(x, y+3, 
+                     f"θ*={test_point['best_theta']}π, ΔΦ={test_point['phase_diffs']}π\nθ_geo={theta_geo:.1f}°, θ_cal={theta_cal:.1f}° OR {-1 * theta_cal:.1f}°", 
+                    color='white', fontsize=9,
+                    ha='center', va=va, 
+                    bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
+            # two possible theta_cal directions
+            for i in [(1, '#555555'), (-1, '#bbbbbb')]: 
+                dx = FIELD_SIZE * 0.2 * np.cos(theta_cal * i[0] * np.pi / 180 + self.antenna_layout_direction)
+                dy = FIELD_SIZE * 0.2 * np.sin(theta_cal * i[0] * np.pi / 180 + self.antenna_layout_direction)
+                ax.arrow(ap_x, ap_y, dx, dy, 
+                        head_width=2, head_length=3, 
+                        fc=i[1], ec=i[1], 
+                        linestyle='--', 
+                        label=f'θ_cal = {i[0] * theta_cal:.1f}°')
+        
+        # 添加图例
+        handles, labels = ax.get_legend_handles_labels()
+        unique_labels = []
+        unique_handles = []
+        for h, l in zip(handles, labels):
+            if l not in unique_labels:
+                unique_labels.append(l)
+                unique_handles.append(h)
+        ax.legend(handles=unique_handles, labels=unique_labels, 
+                 loc='upper right', fontsize=8)
+        
+        plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {AP_PHASESHIFT_NUM})")
+        plt.xlabel("X (meters)")
+        plt.ylabel("Y (meters)")
+        
+        # Save the figure
+        save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_best_theta.png")
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        plt.close()
 
     def generate_signal(self, sweep_start, location=None):
         '''
         Generate a signal given the sweep start time for a sweep period for a specific location
         '''
         preamble_samples = 10 * len(AP_PREAMBLES[0])
-        scan_samples = AP_PHASESHIFT_NUM
-        
-        # Generate the time axis and the corresponding samples
+        scan_samples = 2 * AP_PHASESHIFT_NUM
         preamble_ts = np.linspace(sweep_start, sweep_start+AP_PREAMBLE_T, preamble_samples, endpoint=False)
         scan_ts = np.linspace(sweep_start+AP_PREAMBLE_T, sweep_start+AP_SWEEP_T, scan_samples, endpoint=False)
         timestamps = np.concatenate([preamble_ts, scan_ts]).tolist()
         samples = []
         for t in timestamps: 
-            samples.append(self.sample_signal(t, location))
+            samples.append(self.sample_signal(t, location, test=True))
         return timestamps, samples
     
     def transmit_signal(self, bees, timestamp):
@@ -648,19 +855,11 @@ class AP:
         # Send the signal to all bees
         for bee in bees: 
             timestamps, raw_amps = self.generate_signal(sweep_start, bee.location_normalized)
-            print  (f"\nbee {bee.bee_id} location: {bee.location_normalized}\nraw_amps: {[round(i, 3) for i in raw_amps]}")
+            # print  (f"\nbee {bee.bee_id} location: {bee.location_normalized}\nraw_amps: {[round(i, 3) for i in raw_amps]}")
             attenuation = self.calculate_attenuation(bee.location_normalized)
             amp_scale = 10**(-attenuation/20)
             samples = [s * amp_scale for s in raw_amps]  # Now s is a single value
             bee.receive_signal(timestamps, samples)
-
-    def get_signal_start(self):
-        return self.signal_start
-
-    def set_signal_start(self, 
-                         timestamp # in ms
-                         ):
-        self.signal_start = timestamp
 
     def test_signal_characteristics(self, timestamp):
         '''
@@ -875,215 +1074,6 @@ class AP:
         phase_diffs = [(d - distances[0]) * (2 * np.pi / self.wavelength) for d in distances[1:]]
         return np.array(phase_diffs)
 
-    def test_beamforming_best_theta(self):
-        """
-        Generate the beamforming maximum amplitude mapping to phase shifts
-        """
-        # Create the test grid
-        grid_size = 201 # handle the edge case
-        x = np.linspace(0, FIELD_SIZE, grid_size, endpoint=True)
-        y = np.linspace(0, FIELD_SIZE, grid_size, endpoint=True)
-        
-        # 初始化存储矩阵
-        max_amplitudes = np.zeros((grid_size, grid_size))
-        best_phases = np.zeros((grid_size, grid_size))
-        
-        # 预计算相位差（调整为N-1维）
-        phase_diffs = np.zeros((grid_size, grid_size, self.antenna_num-1))
-        for i in range(grid_size):
-            for j in range(grid_size):
-                norm_pos = np.array([x[i]/FIELD_SIZE, y[j]/FIELD_SIZE])
-                phase_diffs[i,j] = self.calculate_beamforming_phase(norm_pos)
-
-        # 遍历θ范围（0到2π）
-        theta_values = np.linspace(0, 2*np.pi, AP_PHASESHIFT_NUM, endpoint=False)
-        for theta in theta_values:
-            # 复数信号叠加计算
-            complex_sum = np.ones((grid_size, grid_size), dtype=complex)  # 参考天线贡献
-            for k in range(self.antenna_num-1):
-                phase = theta + phase_diffs[:,:,k]  # θ补偿相位差
-                complex_sum += np.exp(1j * phase)   # 复数叠加
-            amplitudes = np.abs(complex_sum)  # 计算模长)
-            
-            # 更新最大值
-            mask = amplitudes > max_amplitudes
-            max_amplitudes[mask] = amplitudes[mask]
-            best_phases[mask] = theta % (2*np.pi)  # 相位归一化
-
-        # Dynamic test point generation
-        max_attempts = 10
-        test_points = []
-        for _ in range(max_attempts): 
-            continue # test the bee hive location
-            theta = np.random.uniform(0, 2*np.pi)
-            direction = np.array([np.cos(theta), np.sin(theta)])
-            
-            # Calculate AP center location (normalized)
-            ap_center = self.location / FIELD_SIZE
-            max_step = min(
-                (1 - ap_center[0])/direction[0] if direction[0]>0 else ap_center[0]/-direction[0],
-                (1 - ap_center[1])/direction[1] if direction[1]>0 else ap_center[1]/-direction[1],
-                key=abs
-            ) if not np.allclose(direction, 0) else 0
-            if max_step < 0.2: continue
-            
-            # Generate two test points (distance ≥ 0.2)
-            step1 = np.random.uniform(0.1, max_step-0.1)
-            step2 = step1 + 0.2 + np.random.uniform(0, 0.1)
-            if step2 > max_step: continue
-            p1 = ap_center + direction * step1
-            p2 = ap_center + direction * step2
-            test_points = [p1, p2]
-            break
-        else: # fallback to the default test points
-            test_points = [
-                # bee hive: [0.5, 0.1]
-                # 150 degrees: [0.5, 0.644]
-                np.array(HIVE_POS_NORM) 
-            ]
-            # test_points = [
-            #     np.array([self.location_normalized[0] + 0.1, self.location_normalized[1]]),
-            #     np.array([self.location_normalized[0] + 0.2, self.location_normalized[1]])
-            # ]
-
-        # 存储测试点信息
-        test_info = []
-        for point_idx, norm_pos in enumerate(test_points):
-            print(f"\nTestpoint {point_idx+1} optimal phase calculation:")
-            print(f"├─ Normalized coordinates: ({norm_pos[0]:.3f}, {norm_pos[1]:.3f})")
-            pos_m = norm_pos * FIELD_SIZE
-            print(f"├─ Actual coordinates: ({pos_m[0]:.1f}m, {pos_m[1]:.1f}m)")
-            
-            # Calculate the distance to each antenna
-            print("├─ Antenna distance to test point:")
-            for i, ant_loc in enumerate(self.antenna_locations):
-                dist = np.linalg.norm(pos_m - ant_loc)
-                print(f"│   {'→' if i==0 else ' '} Antenna {i}: {dist:.2f}m" + 
-                     f"{' (referenced distance)' if i==0 else ''}")
-            
-            # Calculate the phase differences
-            # Calculate the optimal θ and signal amplitude
-            phase_diffs = self.calculate_beamforming_phase(norm_pos)
-            max_amp, best_theta = beamforming_phases_to_best_theta(phase_diffs)
-            print(f"├─ Antenna phase differences: {[round((pd/np.pi).item(), 3) for pd in phase_diffs]}π")
-            
-            # Calculate the attenuation
-            atten = self.calculate_attenuation(norm_pos)
-            print(f"└─ Optimal θ: {best_theta/np.pi:.3f}π")
-            print(f"   ├─ Maximum amplitude: {max_amp:.3f}")
-            print(f"   └─ Total attenuation: {atten:.2f}dB")
-            
-            # 存储计算结果
-            test_info.append({
-                'location': norm_pos,
-                'phase_diffs': [round(float(pd/np.pi),3) for pd in phase_diffs],  # 转换为原生float
-                'best_theta': round(float(best_theta/np.pi),3),
-                'max_amp': round(float(max_amp),3), 
-                'atten': round(float(atten),2)
-            })
-
-        # 绘制热力图
-        plt.figure(figsize=(12, 10))
-        
-        # 创建自定义颜色映射（包含alpha通道）
-        blues = plt.cm.Blues(np.linspace(0.1, 0.9, 256 + 1))  # 调整颜色范围
-        blues[:, 3] = np.linspace(0.1, 0.6, 256 + 1)  # 设置透明度渐变
-        cmap = ListedColormap(blues)
-
-        # 动态计算绘图范围
-        img = plt.imshow(best_phases.T,  # 转置矩阵以匹配坐标方向
-                  extent=[0, FIELD_SIZE, 0, FIELD_SIZE / FIELD_ASPECT_RATIO],
-                  origin='lower',
-                  cmap=cmap,
-                  aspect='equal',
-                  vmin=0, 
-                  vmax=2*np.pi,
-                  interpolation='bilinear')
-        
-        # Configure the color bar
-        cbar = plt.colorbar(img, 
-                           label='Optimal Phase Shift θ (rad)',
-                           ticks=np.linspace(0, 2*np.pi, 5, endpoint=True),
-                           extend='both')
-        cbar.set_ticklabels(['0', 'π/2', 'π', '3π/2', '2π'])
-        cbar.outline.set_edgecolor('black')
-
-        # Add environment markers
-        self.draw_plot_environment_markers()
-        
-        # 添加天线方向箭头和角度标注
-        ax = plt.gca()
-        ap_x, ap_y = self.location
-        ax.plot(ap_x, ap_y, 'r^', markersize=15, zorder=5)
-        
-        # 绘制天线阵列方向
-        ant_dir = self.antenna_locations[1] - self.antenna_locations[0]
-        ant_dir /= np.linalg.norm(ant_dir)
-        ax.arrow(ap_x, ap_y, ant_dir[0] * 0.05 * FIELD_SIZE, ant_dir[1] * 0.05 * FIELD_SIZE, 
-                head_width=2, head_length=3, fc='black', ec='black', zorder=5, 
-                label='Antenna direction')
-        
-        # 强制设置坐标轴范围
-        ax.set_xlim(0, FIELD_SIZE)
-        ax.set_ylim(0, FIELD_SIZE / FIELD_ASPECT_RATIO)
-        
-        # 绘制测试点向量和角度标注
-        for i, test_point in enumerate(test_info):
-            px, py = test_point['location'] * FIELD_SIZE
-            dx, dy = px - ap_x, py - ap_y
-            dx, dy = dx / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE, dy / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE
-            # The actual direction
-            # ax.arrow(ap_x, ap_y, dx, dy, head_width=2, head_length=3, fc='black', ec='black', linestyle='--')
-            
-            # 计算理论角度（考虑天线方向）
-            dx_rot = dx * np.cos(self.antenna_layout_direction) + dy * np.sin(self.antenna_layout_direction)
-            dy_rot = -dx * np.sin(self.antenna_layout_direction) + dy * np.cos(self.antenna_layout_direction)
-            theta_geo = np.degrees(np.arctan2(dy_rot, dx_rot))
-            theta_cal = best_theta_to_target_angle(test_point['best_theta'])
-
-            # 绘制点
-            x = test_point['location'][0] * FIELD_SIZE
-            y = test_point['location'][1] * FIELD_SIZE
-            if i == 0:
-                plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4, label=f'Test Points')
-            else:
-                plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4)
-            va = 'bottom' if y < FIELD_SIZE*0.8 else 'top'
-            plt.text(x, y+3, 
-                     f"θ*={test_point['best_theta']}π, ΔΦ={test_point['phase_diffs']}π\nθ_geo={theta_geo:.1f}°, θ_cal={theta_cal:.1f}° OR {-1 * theta_cal:.1f}°", 
-                    color='white', fontsize=9,
-                    ha='center', va=va, 
-                    bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
-            # two possible theta_cal directions
-            for i in [(1, '#555555'), (-1, '#bbbbbb')]: 
-                dx = FIELD_SIZE * 0.2 * np.cos(theta_cal * i[0] * np.pi / 180 + self.antenna_layout_direction)
-                dy = FIELD_SIZE * 0.2 * np.sin(theta_cal * i[0] * np.pi / 180 + self.antenna_layout_direction)
-                ax.arrow(ap_x, ap_y, dx, dy, 
-                        head_width=2, head_length=3, 
-                        fc=i[1], ec=i[1], 
-                        linestyle='--', 
-                        label=f'θ_cal = {i[0] * theta_cal:.1f}°')
-        
-        # 添加图例
-        handles, labels = ax.get_legend_handles_labels()
-        unique_labels = []
-        unique_handles = []
-        for h, l in zip(handles, labels):
-            if l not in unique_labels:
-                unique_labels.append(l)
-                unique_handles.append(h)
-        ax.legend(handles=unique_handles, labels=unique_labels, 
-                 loc='upper right', fontsize=8)
-        
-        plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {AP_PHASESHIFT_NUM})")
-        plt.xlabel("X (meters)")
-        plt.ylabel("Y (meters)")
-        
-        # Save the figure
-        save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_best_theta.png")
-        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
-        plt.close()
-
     def draw_plot_environment_markers(self):
         """
         Unified environment markers plot
@@ -1231,7 +1221,7 @@ for i, pos in enumerate(AP_POS_NORM):
     # All APs are coarsely synchronized using TDMA, 
     # given the same frequency, all APs uniformly distribute the AP_SWEEP_T
     # so that the signal generation is coherent
-    new_AP.set_signal_start(-i * AP_SWEEP_T)
+    new_AP.signal_start = -i * AP_SWEEP_T
     APs.append(new_AP)
 
 # Generate food sources
@@ -1466,22 +1456,28 @@ ax.legend(handles=legend_elements, loc='upper right')
 # Simulation functions
     # Update bee history and save the bee trail
 def save_bee_trails(current_time):
-        os.makedirs('sim_figures', exist_ok=True)
-        for i, bee in enumerate(sim.bees):
-            bee_dir = f'sim_figures/bee_{i:02d}'
-            os.makedirs(bee_dir, exist_ok=True)
+    os.makedirs('sim_figures', exist_ok=True)
+    os.makedirs('sim_stats', exist_ok=True)
+
+    for i, bee in enumerate(sim.bees):
+        bee_dir = f'sim_figures/bee_{i:02d}'
+        os.makedirs(bee_dir, exist_ok=True)
+        
+        # 创建统计数据目录
+        stats_dir = f'sim_stats/bee_{i:02d}'
+        os.makedirs(stats_dir, exist_ok=True)
             
-            # Create a new canvas
-            fig_bee, ax_bee = plt.subplots(figsize=FIG_SIZE)
-            ax_bee.set_xlim(0, 1)
-            ax_bee.set_ylim(0, 1)
-            ax_bee.set_facecolor('black')
-            
-            # Draw the access points
+        # 创建轨迹图
+        fig_bee, ax_bee = plt.subplots(figsize=FIG_SIZE)
+        ax_bee.set_xlim(0, 1)
+        ax_bee.set_ylim(0, 1)
+        ax_bee.set_facecolor('black')
+        
+        # Draw the access points
         for ap in AP_POS_NORM:
-                ax_bee.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8)
-            
-            # Draw the trajectory of this bee
+            ax_bee.plot(ap[0], ap[1], 'r^', markersize=15, alpha=0.8)
+        
+        # Draw the trajectory of this bee
         trail_locations = []
         trail_alphas = []
         for pos, timestamp in bee.history_location:
@@ -1490,20 +1486,20 @@ def save_bee_trails(current_time):
             if alpha > 0:
                 trail_locations.append(pos)
                 trail_alphas.append(alpha)
-            
+        
         if trail_locations:
-                ax_bee.scatter(
+            ax_bee.scatter(
                 [p[0] for p in trail_locations],
                 [p[1] for p in trail_locations],
-                    c="yellow", 
-                    s=20,
-                    alpha=trail_alphas,
-                    edgecolors='none'
-                )
+                c="yellow", 
+                s=20,
+                alpha=trail_alphas,
+                edgecolors='none'
+            )
         # 添加估计位置绘制
         est_locations = []
         est_alphas = []
-        for pos, ts in bee.history_location_est:
+        for pos, ts in bee.history_location_norm_est:
             age = current_time - ts
             alpha = max(0, 1 - age/MOVEMENT_DISAPPEAR_TIME)
             if alpha > 0:
@@ -1520,9 +1516,9 @@ def save_bee_trails(current_time):
         # 添加图例
         legend_elements = [
             plt.Line2D([0], [0], marker='o', color='none', markerfacecolor='yellow', 
-                      markersize=8, label='Actual Path'),
+                    markersize=8, label='Actual Path'),
             plt.Line2D([0], [0], marker='o', color='none', markerfacecolor='cyan',
-                      markersize=8, label='Estimated')
+                    markersize=8, label='Estimated')
         ]
         ax_bee.legend(handles=legend_elements, loc='lower left', fontsize=7)
         
@@ -1530,7 +1526,82 @@ def save_bee_trails(current_time):
         plt.savefig(f'{bee_dir}/trail_{prev_save_time}ms-{current_time}ms.png', dpi=150, bbox_inches='tight')
         plt.close(fig_bee)
 
+        # 保存CSV数据
+        csv_path = f'{stats_dir}/trail_{prev_save_time}ms-{current_time}ms.csv'
+        with open(csv_path, 'w') as f:
+            # 写入表头
+            header = ['timestamp', 'actual_x', 'actual_y', 'estimated_x', 'estimated_y']
+            header += [f'ap{ap_id}_angle' for ap_id in range(AP_NUM)]
+            f.write(','.join(header) + '\n')
+            
+            all_ts = set()
+            actual_data = {ts: pos for pos, ts in bee.history_location}
+            est_data = {ts: pos for pos, ts in bee.history_location_norm_est}
+            angle_data = {}
+            for ap_id, data in bee.history_ap_angles_est.items():
+                for angle, ts in data:
+                    angle_data[ts] = angle.item()
+                    all_ts.add(ts)
+            
+            all_ts.update(actual_data.keys())
+            all_ts.update(est_data.keys())
+            sorted_ts = sorted(all_ts)
+            # print  (f"\nangle_data: {angle_data}")
+            # print  (f"\nsorted_ts: {sorted_ts}")
+            for ts in sorted_ts: 
+                actual = actual_data.get(ts, (None, None))
+                estimated = est_data.get(ts, (None, None))
+                angle = angle_data.get(ts, {})
+                # print  (f"ts = {round(ts, 2)}, angle: {angle}")
+                row = [
+                    f'{ts}',
+                    f"{actual[0]:.4f}" if actual[0] is not None else '',
+                    f"{actual[1]:.4f}" if actual[1] is not None else '',
+                    f"{estimated[0]:.4f}" if estimated[0] is not None else '',
+                    f"{estimated[1]:.4f}" if estimated[1] is not None else '',
+                    f"{angle:.2f}" if f'{angle}'.isnumeric() else ''
+                ]
+                f.write(','.join(row) + '\n')
 
+        # 新增角度对比图绘制
+        for ap_id in range(AP_NUM):
+            ap_dir = f'sim_figures/AP_{ap_id}'
+            os.makedirs(ap_dir, exist_ok=True)
+            
+            # 收集角度数据
+            est_angles = []
+            est_timestamps = []
+            actual_angles = []
+            actual_timestamps = []
+            
+            # 获取估计角度
+            if ap_id in bee.history_ap_angles_est:
+                for angle, ts in bee.history_ap_angles_est[ap_id]:
+                    if prev_save_time <= ts <= current_time:
+                        est_angles.append(angle)  # already in degrees
+                        est_timestamps.append(ts)
+            
+            # 计算实际角度（根据真实位置）
+            for pos, ts in bee.history_location:
+                if prev_save_time <= ts <= current_time:
+                    ap_pos = AP_POS_NORM[ap_id]
+                    dx = pos[0] - ap_pos[0]
+                    dy = pos[1] - ap_pos[1]
+                    actual_angle = np.arctan2(dy, dx) % np.pi  # 0-π范围
+                    actual_angles.append(np.degrees(actual_angle))
+                    actual_timestamps.append(ts)
+            
+            # 绘制角度对比图
+            plt.figure(figsize=(10, 5))
+            plt.plot(est_timestamps, est_angles, 'b-', label='Estimated')
+            plt.plot(actual_timestamps, actual_angles, 'g--', label='Actual')
+            plt.ylim(0, 180)
+            plt.title(f'AP{ap_id} Angle Comparison ({prev_save_time}-{current_time}ms)')
+            plt.xlabel('Time (ms)')
+            plt.ylabel('Angle (degrees)')
+            plt.legend()
+            plt.savefig(f'{ap_dir}/trail_angle_est_{prev_save_time}ms-{current_time}ms.png', dpi=150)
+            plt.close()
 
 # Determine how many trail traces to save
 current_frame_id = 0
@@ -1540,7 +1611,7 @@ if (NUM_FRAMES < 100):
     trail_save_num = math.ceil(NUM_FRAMES / 10)
 
 # Last sample time of each AP
-last_AP_sample_time = [ap.get_signal_start() for ap in APs]
+last_AP_sample_time = [ap.signal_start for ap in APs]
 frame_0_outputed = False
 
 # Update the frame
@@ -1597,12 +1668,6 @@ def update(frame):
             label.set_visible(True)
         else:
             label.set_visible(False)
-
-    # 渲染部分
-    render_start = time.perf_counter()
-    # ...保持渲染代码...
-    render_duration = (time.perf_counter() - render_start) * 1000
-    if (not frame_0_outputed): print (f"Render time: {render_duration:.2f}ms")
 
     total_duration = (time.perf_counter() - frame_start) * 1000
     if (not frame_0_outputed): print (f"Frame {frame} total time: {total_duration:.2f}ms\n")
