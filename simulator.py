@@ -68,6 +68,41 @@ MOVEMENT_DISAPPEAR_TIME = 10000 # ms
 # Debug print lock
 debug_print_lock = threading.Lock()
 
+# Functions
+def to_meters(norm_pos):
+    return [norm_pos[0] * FIELD_SIZE, norm_pos[1] * FIELD_SIZE / FIELD_ASPECT_RATIO]
+
+def beamforming_phases_to_best_theta(phase_diffs, # in radians, unit: π
+                                        ):
+    """
+    Calculate the best θ for the given phases
+    """
+    max_amp = 0
+    best_theta = 0
+    for theta in np.linspace(0, 2*np.pi, 50, endpoint=False):
+        complex_sum = 1.0
+        for pd in phase_diffs:
+            complex_sum += np.exp(1j*(theta + pd))
+        amp = abs(complex_sum)
+        if amp > max_amp:
+            max_amp = amp
+            best_theta = theta
+    return max_amp, best_theta
+
+def best_theta_to_target_angle(optimal_theta, # in radians, unit: π
+                                ):
+    """
+    Calculate theoretical angle using paper's formula
+    Discrete sampling errors and noises will cause deviation from the theoretical value
+    """
+    if (optimal_theta > 1): 
+        target_phase_diff = 2 - optimal_theta
+    else: 
+        target_phase_diff = -1 * optimal_theta
+    target_phase_diff_normalized = target_phase_diff
+    theta_cal = np.degrees(np.arccos(-1 * target_phase_diff_normalized))
+    return theta_cal
+
 # Class definitions
 class Food:
     def __init__(self, location):
@@ -445,27 +480,6 @@ class AP:
                 y = int(float(y_str))
                 attenuation_map[(x, y)] = float(atten)
         self.attenuation_map = attenuation_map
-
-    def calculate_beamforming_phase(self, norm_pos):
-        pos_m = norm_pos * FIELD_SIZE
-        distances = [np.linalg.norm(pos_m - ant) for ant in self.antenna_locations]
-        # Find Φ for each antenna
-        # Every wavelength is equivalent to 2π phase shift
-        phase_diffs = [(d - distances[0]) * (2 * np.pi / self.wavelength) for d in distances[1:]]
-        # if (norm_pos[0] == 0.5 and norm_pos[1] == 0.5):
-        #     print  (f"\n========= calculate beamforming phase =========")
-        #     print  (f"norm_pos: {norm_pos}, pos_m: {pos_m}")
-        #     print  (f"distances: {[round(i, 2) for i in distances]}")
-        #     print  (f"phase_diffs: {[round(i, 2) for i in phase_diffs]}")
-        return np.array(phase_diffs)
-
-    def calculate_attenuation(self, location):
-        '''
-        Retrieve the attenuation from the attenuation map
-        '''
-        x = int(location[0] * FIELD_SIZE)
-        y = int(location[1] * FIELD_SIZE / FIELD_ASPECT_RATIO)
-        return self.attenuation_map.get((x, y), 0.0)
     
     def sample_signal(self, timestamp, location=None): 
         '''
@@ -662,7 +676,7 @@ class AP:
         print (f"├─ Single Period: {period_ns:.4f}ns")
         print (f"├─ Wavelength: {self.wavelength:.4f}m")
         print (f"├─ Antenna Spacing: {self.antenna_spacing:.4f}m (half wavelength)")
-        print (f"├─ Antenna Layout Direction: {self.antenna_layout_direction}rad")
+        print (f"├─ Antenna Layout Direction: {round(self.antenna_layout_direction, 3)}π")
         for i in range(self.antenna_num):
             print (f"│   {'├─' if i < self.antenna_num - 1 else '└─'} Antenna {i} Location: {[round(i, 3) for i in self.antenna_locations[i]]}")
         print (f"└─ 3 Cycles Duration: {signal_duration_ns:.2f}ns")
@@ -729,7 +743,6 @@ class AP:
         plt.subplot(3, 1, 3)
         for j in range(2, self.antenna_num+1):
             phases = [(j-1) * np.pi * np.sin(theta) for theta in theta_values]  # 以π为单位
-            
             # Preamble phase [the preamble line will not be displayed]
             # preamble_mask = [t < AP_PREAMBLE_T for t in timestamps]
             # plt.plot(np.array(timestamps)[preamble_mask], 
@@ -763,22 +776,23 @@ class AP:
                   dpi=300, bbox_inches='tight')
         plt.close()
 
-    def optimal_phase_to_angle(self, 
-                               optimal_theta, # in radians, unit: π
-                               ):
-        """
-        Calculate theoretical angle using paper's formula
-        Discrete sampling errors and noises will cause deviation from the theoretical value
-        """
-        if (optimal_theta > 1): 
-            target_phase_diff = 2 - optimal_theta
-        else: 
-            target_phase_diff = -1 * optimal_theta
-        target_phase_diff_normalized = target_phase_diff
-        theta_cal = np.degrees(np.arccos(-1 * target_phase_diff_normalized))
-        return theta_cal
-    
-    def test_beamforming_optimal_phases(self):
+    def calculate_attenuation(self, location):
+        '''
+        Retrieve the attenuation from the attenuation map
+        '''
+        x = int(location[0] * FIELD_SIZE)
+        y = int(location[1] * FIELD_SIZE / FIELD_ASPECT_RATIO)
+        return self.attenuation_map.get((x, y), 0.0)
+
+    def calculate_beamforming_phase(self, norm_pos):
+        # Find Φ for each antenna
+        # Every wavelength is equivalent to 2π phase shift
+        pos_m = norm_pos * FIELD_SIZE
+        distances = [np.linalg.norm(pos_m - ant) for ant in self.antenna_locations]
+        phase_diffs = [(d - distances[0]) * (2 * np.pi / self.wavelength) for d in distances[1:]]
+        return np.array(phase_diffs)
+
+    def test_beamforming_best_theta(self):
         """
         Generate the beamforming maximum amplitude mapping to phase shifts
         """
@@ -862,20 +876,10 @@ class AP:
                      f"{' (referenced distance)' if i==0 else ''}")
             
             # Calculate the phase differences
-            phase_diffs = self.calculate_beamforming_phase(norm_pos)
-            print(f"├─ Antenna phase differences: {[round(pd/np.pi, 3) for pd in phase_diffs]}π")
-            
             # Calculate the optimal θ and signal amplitude
-            max_amp = 0
-            best_theta = 0
-            for theta in np.linspace(0, 2*np.pi, 50, endpoint=False):
-                complex_sum = 1.0
-                for pd in phase_diffs:
-                    complex_sum += np.exp(1j*(theta + pd))
-                amp = abs(complex_sum)
-                if amp > max_amp:
-                    max_amp = amp
-                    best_theta = theta
+            phase_diffs = self.calculate_beamforming_phase(norm_pos)
+            max_amp, best_theta = beamforming_phases_to_best_theta(phase_diffs)
+            print(f"├─ Antenna phase differences: {[round(pd/np.pi, 3) for pd in phase_diffs]}π")
             
             # Calculate the attenuation
             atten = self.calculate_attenuation(norm_pos)
@@ -938,7 +942,7 @@ class AP:
         ax.set_ylim(0, FIELD_SIZE / FIELD_ASPECT_RATIO)
         
         # 绘制测试点向量和角度标注
-        for test_point in test_info:
+        for i, test_point in enumerate(test_info):
             px, py = test_point['position'] * FIELD_SIZE
             dx, dy = px - ap_x, py - ap_y
             dx, dy = dx / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE, dy / np.linalg.norm([dx, dy]) * 0.1 * FIELD_SIZE
@@ -949,12 +953,15 @@ class AP:
             dx_rot = dx * np.cos(self.antenna_layout_direction) + dy * np.sin(self.antenna_layout_direction)
             dy_rot = -dx * np.sin(self.antenna_layout_direction) + dy * np.cos(self.antenna_layout_direction)
             theta_geo = np.degrees(np.arctan2(dy_rot, dx_rot))
-            theta_cal = self.optimal_phase_to_angle(test_point['best_theta'])
+            theta_cal = best_theta_to_target_angle(test_point['best_theta'])
 
             # 绘制点
             x = test_point['position'][0] * FIELD_SIZE
             y = test_point['position'][1] * FIELD_SIZE
-            plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4)
+            if i == 0:
+                plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4, label=f'Test Points')
+            else:
+                plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4)
             va = 'bottom' if y < FIELD_SIZE*0.8 else 'top'
             plt.text(x, y+3, 
                      f"θ*={test_point['best_theta']}π, ΔΦ={test_point['phase_diffs']}π\nθ_geo={theta_geo:.1f}°, θ_cal={theta_cal:.1f}° OR {-1 * theta_cal:.1f}°", 
@@ -962,9 +969,9 @@ class AP:
                     ha='center', va=va, 
                     bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
             # two possible theta_cal directions
-            for i in [(1, '#ff0000'), (-1, '#bb0000')]: 
-                dx = FIELD_SIZE * 0.2 * np.cos(theta_cal * i[0] * np.pi / 180)
-                dy = FIELD_SIZE * 0.2 * np.sin(theta_cal * i[0] * np.pi / 180)
+            for i in [(1, '#555555'), (-1, '#bbbbbb')]: 
+                dx = FIELD_SIZE * 0.2 * np.cos(theta_cal * i[0] * np.pi / 180 + self.antenna_layout_direction)
+                dy = FIELD_SIZE * 0.2 * np.sin(theta_cal * i[0] * np.pi / 180 + self.antenna_layout_direction)
                 ax.arrow(ap_x, ap_y, dx, dy, 
                         head_width=2, head_length=3, 
                         fc=i[1], ec=i[1], 
@@ -987,7 +994,7 @@ class AP:
         plt.ylabel("Y (meters)")
         
         # Save the figure
-        save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_optimal_phases.png")
+        save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_best_theta.png")
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
 
@@ -1125,10 +1132,6 @@ class Simulation:
                 fs.recovery_timer = 1000 / FRAME_TIME * NECTAR_EXPECTED_RECOVERY_TIME * (0.8 + 0.4 * random.random())
 
 
-
-# Convert normalized coordinates to actual meters
-def to_meters(norm_pos):
-    return [norm_pos[0] * FIELD_SIZE, norm_pos[1] * FIELD_SIZE / FIELD_ASPECT_RATIO]
 
 # Generate APs
 APs = []
@@ -1328,7 +1331,7 @@ for ap in APs:
     print (f"\nTest AP{ap.ap_id} Signal Characteristics at (0,0) ...")
     ap.test_signal_charactertistics_at_location((0.0, 0.0))
     print (f"\nTest AP{ap.ap_id} Beamforming Optimal Phases ...")
-    ap.test_beamforming_optimal_phases()
+    ap.test_beamforming_best_theta()
 
 
 
