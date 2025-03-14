@@ -2,7 +2,9 @@
 
 ## Introduction
 
-This simulator implements a bio-inspired wireless localization system based on the "Living IoT" concept presented in the SIGCOMM'19 paper: ```Living IoT: A Flying Wireless Platform on Live Insects```. The system utilizes live insects (bumblebees) as mobile platforms carrying IoT devices, with multiple Access Points (APs) employing beamforming techniques for real-time positioning.
+This simulator implements a bio-inspired wireless localization system based on the "Living IoT" concept presented in the SIGCOMM'19 paper: ```Living IoT: A Flying Wireless Platform on Live Insects``` (https://arxiv.org/pdf/1812.09419). 
+
+The system utilizes live insects (bumblebees) as mobile platforms carrying IoT devices, with multiple Access Points (APs) employing beamforming techniques for real-time positioning.
 
 Key features of the simulator:
 
