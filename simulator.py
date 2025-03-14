@@ -19,7 +19,7 @@ if os.path.exists('sim_figures'):
 NUM_BEES = 2
 NUM_FOOD_SOURCES = 5  # randomly distributed in the field
 HIVE_POS_NORM = (0.5, 0.1)                  # normalized
-AP_POS_NORM = [(0.25, 0.5), (0.75, 0.5)]    # normalized
+AP_POS_NORM = [(0.5, 0.0), (0.0, 0.5)]    # normalized
 AP_NUM = len(AP_POS_NORM)
 FIG_SIZE = (8, 8)
 NECTAR_DISPLAY_SIZE = 50
@@ -42,7 +42,7 @@ AP_NUM_ANTENNAS = 2
 AP_FREQ = 915e6         # 915 MHz
 AP_SIGNAL_STRENGTH = 28 # dBm
 AP_SIGNAL_AMPLITUDE = 10**(AP_SIGNAL_STRENGTH / 20)  # 转换dBm为线性振幅
-AP_ANTENNA_LAYOUT_DIRECTION = 0 # radians, counterclockwise from the positive x-axis
+AP_ANTENNA_LAYOUT_DIRECTION = [0, 3 * np.pi / 2] # radians, counterclockwise from the positive x-axis
 
 # Simulation Parameters
 FRAME_TIME = 50    # ms
@@ -762,7 +762,22 @@ class AP:
         plt.savefig(os.path.join(output_dir, f"signal_charactertistics_at_location_{norm_pos[0]:.2f}_{norm_pos[1]:.2f}.png"), 
                   dpi=300, bbox_inches='tight')
         plt.close()
-
+    
+    def optimal_phase_to_angle(self, 
+                               optimal_theta, # in radians, unit: π
+                               ):
+        """
+        Calculate theoretical angle using paper's formula
+        Discrete sampling errors and noises will cause deviation from the theoretical value
+        """
+        if (optimal_theta > 1): 
+            target_phase_diff = 2 - optimal_theta
+        else: 
+            target_phase_diff = -1 * optimal_theta
+        target_phase_diff_normalized = target_phase_diff
+        theta_cal = np.degrees(np.arccos(-1 * target_phase_diff_normalized))
+        return theta_cal
+    
     def test_beamforming_optimal_phases(self):
         """
         Generate the beamforming maximum amplitude mapping to phase shifts
@@ -802,7 +817,8 @@ class AP:
         max_attempts = 10
         test_points = []
         for _ in range(max_attempts): 
-            continue    ###############
+
+            continue ###############
             theta = np.random.uniform(0, 2*np.pi)
             direction = np.array([np.cos(theta), np.sin(theta)])
             
@@ -928,64 +944,21 @@ class AP:
             ax.arrow(ap_x, ap_y, dx, dy, head_width=2, head_length=3, fc='black', ec='black', linestyle='--')
             
             # 计算理论角度（考虑天线方向）
-            dx_rot = dx * np.cos(AP_ANTENNA_LAYOUT_DIRECTION) + dy * np.sin(AP_ANTENNA_LAYOUT_DIRECTION)
-            dy_rot = -dx * np.sin(AP_ANTENNA_LAYOUT_DIRECTION) + dy * np.cos(AP_ANTENNA_LAYOUT_DIRECTION)
+            dx_rot = dx * np.cos(self.antenna_layout_direction) + dy * np.sin(self.antenna_layout_direction)
+            dy_rot = -dx * np.sin(self.antenna_layout_direction) + dy * np.cos(self.antenna_layout_direction)
             theta_geo = np.degrees(np.arctan2(dy_rot, dx_rot))
-            
-            # Calculate theoretical angle using paper's formula
-            d = self.wavelength / 2  # Antenna spacing (λ/2)
+            theta_cal = self.optimal_phase_to_angle(test_point['best_theta'])
 
-            # This is the APPLIED phase shift (0-2π), NOT the measured phase difference
-            # CRUCIAL: When θ* = -Φ + 2πk, the amplitude is maximized
-            # We can threat Φ = -θ* as the target phase difference
-            quadrant_flip = 1 # 1 for [0,π], -1 for [-π,0]
-            if (test_point["best_theta"] > 0): 
-                if (test_point["best_theta"] > 1): 
-                    target_phase_diff = 2 - test_point['best_theta']
-                else: 
-                    target_phase_diff = -1 * test_point['best_theta']
-                quadrant_flip = -1
-                
-
-            # Normalize the phase difference to [-1,1]
-            # The mechanism is, the hypotenuse represents have wavelength, 
-            # which is equivalent to π phase shift
-            # consider phase_diff / np.pi * np.pi = phase_diff
-            # the first np.pi is the phase shift equivalent to the antenna spacing, wavelength / 2, where the whole wavelength is 2π phase shift
-            # the second np.pi is the conversion from radians to degrees
-
-            # note the target β formulation angle uses the opposite direction of the phase difference
-            # therefore, we need to times -1 to the phase difference before np.arccos it
-            # also, as arccos only returns the result in [0,π], we need to judge the sign of the phase difference
-            # times -1 to the result if the phase difference is negative
-            target_phase_diff_normalized = target_phase_diff
-            if target_phase_diff_normalized < -1: target_phase_diff_normalized += 2
-            elif target_phase_diff_normalized > 1: target_phase_diff_normalized -= 2
-            assert target_phase_diff_normalized >= -1 and target_phase_diff_normalized <= 1, f"normalized_phase = {target_phase_diff_normalized} is out of range [-1,1]"
-            theta_cal = quadrant_flip * np.degrees(np.arccos(-1 * target_phase_diff_normalized))
-
-            # Debug print to verify calculation parameters
-            print (f"[DEBUG] phase_diff = {target_phase_diff:.3f}π, λ={self.wavelength:.3f}m, d={d:.3f}m")
-            print (f"[DEBUG] phase_diff normalized = {target_phase_diff_normalized:.3f} (must be in [-1,1] for valid arccos)")
-            print (f"[DEBUG] theta_geo = {theta_geo:.3f}°, theta_cal = {theta_cal:.3f}°")
-
+            # 绘制点
             x = test_point['position'][0] * FIELD_SIZE
             y = test_point['position'][1] * FIELD_SIZE
-            
-            # 绘制点
             plt.scatter(x, y, s=120, c='white', edgecolors='red', linewidths=1.5, zorder=4)
-            
-            # 动态调整文本位置
             va = 'bottom' if y < FIELD_SIZE*0.8 else 'top'
             plt.text(x, y+3, 
-                     f"θ*={test_point['best_theta']}π, ΔΦ={test_point['phase_diffs']}π\nθ_geo={theta_geo:.1f}°, θ_cal={theta_cal:.1f}°", 
+                     f"θ*={test_point['best_theta']}π, ΔΦ={test_point['phase_diffs']}π\nθ_geo={theta_geo:.1f}°, θ_cal={theta_cal:.1f}° OR {-1 * theta_cal:.1f}°", 
                     color='white', fontsize=9,
                     ha='center', va=va, 
                     bbox=dict(facecolor='black', alpha=0.7, edgecolor='none'))
-
-        # 在colorbar旁添加公式
-        # cbar.ax.text(1.5, 0.5, r'$\theta = \arcsin\left(\frac{\phi \lambda}{2\pi d}\right)$',
-        #             rotation=90, va='center', fontsize=10, color='black')
         
         plt.title(f"AP{self.ap_id} Optimal Phase Map\n(Phase shifts per sweep: {AP_PHASESHIFT_NUM})")
         plt.xlabel("X (meters)")
@@ -995,7 +968,6 @@ class AP:
         save_path = os.path.join(os.path.dirname(__file__), f"sim_figures/AP_{self.ap_id}/beamforming_optimal_phases.png")
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
         plt.close()
-
 
     def draw_plot_environment_markers(self):
         """
@@ -1144,7 +1116,7 @@ for i, pos in enumerate(AP_POS_NORM):
                   AP_NUM_ANTENNAS, 
                   AP_FREQ, 
                   AP_PREAMBLES[i], 
-                  AP_ANTENNA_LAYOUT_DIRECTION)
+                  AP_ANTENNA_LAYOUT_DIRECTION[i])
     # All APs are coarsely synchronized using TDMA, 
     # given the same frequency, all APs uniformly distribute the AP_SWEEP_T
     # so that the signal generation is coherent
