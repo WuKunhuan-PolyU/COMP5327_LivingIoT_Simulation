@@ -767,9 +767,9 @@ class AP:
                     label=f'Antenna {j} Phase')
 
         # Set y-axis ticks as multiples of π
-        max_phase = (self.antenna_num-1)
-        y_ticks = np.arange(-max_phase, max_phase+1)
-        plt.yticks(y_ticks, [f'{x}' if x !=0 else '0' for x in y_ticks])
+        max_phase = (self.antenna_num-1) * np.pi
+        y_ticks = np.arange(-max_phase, max_phase+1, np.pi)
+        plt.yticks(y_ticks, [f'{int(x/np.pi)}π' if x !=0 else '0' for x in y_ticks])
         plt.xlabel("Time (ms)")
         plt.ylabel("Antenna Phase shifts = (j-1)πsin(θ)")
         plt.grid(alpha=0.3)
