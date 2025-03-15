@@ -282,7 +282,7 @@ class Bee:
                                 c='red', s=30, zorder=3)
             
             # Mark the angle calculation result
-            rblues = ['#003333', '#006666', '#009999', '#00CCCC']
+            rblues = ['#006666', '#009999', '#00CCCC']
             for (max_amp_ts, ap_id), angle, point_amp in self.signal_memory_ap_angles: 
                 if ap_id not in labelled_angle_aps:
                     plt.scatter(max_amp_ts, point_amp, c=rblues[len(labelled_angle_aps)%len(rblues)], s=60, zorder=3,
@@ -580,8 +580,7 @@ class AP:
         sweep_start = self.signal_start + ((timestamp - self.signal_start) // (AP_NUM * AP_SWEEP_T)) * (AP_NUM * AP_SWEEP_T)
         if timestamp < sweep_start + AP_PREAMBLE_T:  
             # Within preamble stage: Sample a signal according to the preamble bit pattern
-            return AP_SIGNAL_AMPLITUDE * AP_PREAMBLES[self.ap_id][
-                int((timestamp - sweep_start) / AP_PREAMBLE_T * len(AP_PREAMBLES[self.ap_id]))
+            return AP_SIGNAL_AMPLITUDE * AP_PREAMBLES[self.ap_id][int((timestamp - sweep_start) / AP_PREAMBLE_T * len(AP_PREAMBLES[self.ap_id]))
             ]
         else:  
             # Within beamforming scanning stage: Signals from antennas are superposed in the complex domain
@@ -592,7 +591,7 @@ class AP:
             for i in range(self.antenna_num - 1):
                 phase = ap_theta + phase_diffs[i]
                 complex_sum += np.exp(1j * phase)
-            amplitude = np.abs(complex_sum)
+            amplitude = AP_SIGNAL_AMPLITUDE * np.abs(complex_sum) / self.antenna_num  # normalize by the number of antennas
             return amplitude
     
     def generate_signal(self, sweep_start, location=None):
@@ -722,7 +721,7 @@ class AP:
             # Simulate the phase shift of the antennas according to the paper
             equivalent_signal_start = self.signal_start + AP_SWEEP_T * ((t - self.signal_start) // AP_SWEEP_T)
             attenuation = self.calculate_attenuation(location)
-            amp_scale = 10 ** (-(AP_SIGNAL_AMPLITUDE - attenuation)/20)
+            amp_scale = 10 ** (-attenuation/20)
             actual_amp = self.sample_signal(t, location) * amp_scale
             attenuated.append(actual_amp)
             phase_shift = 0 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (t - equivalent_signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
