@@ -725,7 +725,7 @@ class AP:
             amp_scale = 10 ** (-(AP_SIGNAL_AMPLITUDE - attenuation)/20)
             actual_amp = self.sample_signal(t, location) * amp_scale
             attenuated.append(actual_amp)
-            phase_shift = -np.pi/2 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (t - equivalent_signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
+            phase_shift = 0 + (np.pi / AP_PHASESHIFT_NUM) * int(AP_PHASESHIFT_NUM * (t - equivalent_signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T))
             phases.append(phase_shift)
 
         # Figure 1: Original signal figure
@@ -750,10 +750,10 @@ class AP:
         theta_values = []
         for t in timestamps:
             if t < self.signal_start + AP_PREAMBLE_T: 
-                theta_values.append(-np.pi/2)
+                theta_values.append(0)
             else:
                 scan_progress = (t - self.signal_start - AP_PREAMBLE_T) / (AP_SWEEP_T - AP_PREAMBLE_T)
-                theta = -np.pi/2 + scan_progress * np.pi
+                theta = 0 + scan_progress * 2 * np.pi # Use 0 to 2π here. The paper uses -π to π.
                 theta_values.append(theta)
 
         # Figure 3: Phase change figure
@@ -771,7 +771,7 @@ class AP:
         y_ticks = np.arange(-max_phase, max_phase+1)
         plt.yticks(y_ticks, [f'{x}' if x !=0 else '0' for x in y_ticks])
         plt.xlabel("Time (ms)")
-        plt.ylabel("Phase (-π to π)")
+        plt.ylabel("Antenna Phase shifts = (j-1)πsin(θ)")
         plt.grid(alpha=0.3)
 
         # Add preamble region annotation
